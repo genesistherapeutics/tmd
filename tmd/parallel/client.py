@@ -40,6 +40,9 @@ class BaseFuture(ABC):
     @abstractmethod
     def result(self) -> Any: ...
 
+    @abstractmethod
+    def cancel(self) -> bool: ...
+
     @property
     @abstractmethod
     def id(self) -> str: ...
@@ -115,6 +118,9 @@ class _MockFuture(BaseFuture):
     def done(self) -> bool:
         return True
 
+    def cancel(self) -> bool:
+        return False
+
     @property
     def id(self) -> str:
         """
@@ -140,6 +146,9 @@ class WrappedFuture(BaseFuture):
 
     def done(self) -> bool:
         return self._future.done()
+
+    def cancel(self) -> bool:
+        return self._future.cancel()
 
     @property
     def id(self) -> str:
@@ -346,6 +355,9 @@ class BinaryFutureWrapper:
 
     def done(self) -> bool:
         return self._future.done()
+
+    def cancel(self) -> bool:
+        return self._future.cancel()
 
     @property
     def id(self) -> str:
