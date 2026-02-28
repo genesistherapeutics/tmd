@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import io
+import logging
 import os
 import pickle
 import time
@@ -19,6 +21,7 @@ import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import Callable, Optional, Union, cast
 
 import numpy as np
@@ -84,6 +87,82 @@ DEFAULT_REST_PARAMS = replace(
         rest_params=RESTParams(max_temperature_scale=3.0, temperature_scale_interpolation="exponential"),
     ),
 )
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
+
+
+class _SummaryLogger:
+    """Optional structured logger for RBFE pipeline phases.
+
+    When *enabled*, prints clean per-phase summaries to stdout (prefixed with
+    ``prefix`` for interleaved readability) and accumulates the full log text
+    so it can be written to a file at the end of a leg.
+
+    When *disabled* (the default), every method is a no-op and the existing
+    verbose output in the library is left untouched.
+    """
+
+    def __init__(self, prefix: str, enabled: bool = False):
+        self.prefix = prefix
+        self.enabled = enabled
+        self._buf = io.StringIO() if enabled else None
+        self._phase_t0: float | None = None
+
+    def _emit(self, line: str) -> None:
+        tagged = f"[{self.prefix}] {line}"
+        print(tagged, flush=True)
+        assert self._buf is not None
+        self._buf.write(tagged + "\n")
+
+    def phase_start(self, name: str) -> None:
+        if not self.enabled:
+            return
+        self._phase_t0 = time.perf_counter()
+        self._emit(f"== {name} ==")
+
+    def phase_end(self, name: str, **metrics: object) -> None:
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self._phase_t0 if self._phase_t0 else 0.0
+        parts = [f"{k}: {v}" for k, v in metrics.items()]
+        if parts:
+            self._emit("  " + " | ".join(parts))
+        self._emit(f"  Completed in {_fmt_elapsed(elapsed)}")
+
+    def info(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        self._emit(f"  {msg}")
+
+    def warning(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        self._emit(f"  WARNING: {msg}")
+
+    def progress(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        self._emit(f"  {msg}")
+
+    def get_log_text(self) -> str:
+        if self._buf is None:
+            return ""
+        return self._buf.getvalue()
+
+    def write_to_file(self, path: Path) -> None:
+        text = self.get_log_text()
+        if text:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
 
 
 def _get_default_state_minimization_configs() -> Sequence[minimizer.MinimizationConfig]:
@@ -324,6 +403,7 @@ def setup_initial_states(
     seed: int,
     verify_constraints: bool,
     min_cutoff: Optional[float] = None,
+    verbose: bool = True,
 ) -> list[InitialState]:
     """
     Given a sequence of lambda values, return a list of initial states.
@@ -357,6 +437,9 @@ def setup_initial_states(
         Throw error if any atom moves more than this distance (nm) after minimization. Typically only meaningful
         in the complex leg where the check may indicate that the ligand is no longer posed reliably.
 
+    verbose: bool
+        Print per-state progress messages during minimization.
+
     Returns
     -------
     list of InitialState
@@ -372,7 +455,7 @@ def setup_initial_states(
 
     # minimize ligand and environment atoms within min_cutoff of the ligand
     # optimization introduces dependencies among states with lam < 0.5, and among states with lam >= 0.5
-    optimized_x0s = optimize_coordinates(initial_states, min_cutoff=min_cutoff)
+    optimized_x0s = optimize_coordinates(initial_states, min_cutoff=min_cutoff, verbose=verbose)
 
     # update initial states in-place
     for state, x0 in zip(initial_states, optimized_x0s):
@@ -534,16 +617,19 @@ def get_free_idxs(initial_state: InitialState, cutoff: float = 0.5) -> list[int]
 
 
 def _optimize_coords_along_states(
-    initial_states: list[InitialState], k: float, minimization_configs: Sequence[minimizer.MinimizationConfig]
+    initial_states: list[InitialState],
+    k: float,
+    minimization_configs: Sequence[minimizer.MinimizationConfig],
+    verbose: bool = True,
 ) -> list[NDArray]:
-    # use the end-state to define the optimization settings
     end_state = initial_states[0]
 
     x_opt = end_state.x0
 
     x_traj = []
     for idx, initial_state in enumerate(initial_states):
-        print(f"Optimizing initial state at λ={initial_state.lamb}")
+        if verbose:
+            print(f"Optimizing initial state at λ={initial_state.lamb}")
         free_idxs = get_free_idxs(initial_state)
         try:
             x_opt = optimize_coords_state(
@@ -568,6 +654,7 @@ def optimize_coordinates(
     min_cutoff: Optional[float] = 0.7,
     k: float = DEFAULT_POSITIONAL_RESTRAINT_K,
     minimization_configs: Optional[Sequence[minimizer.MinimizationConfig]] = None,
+    verbose: bool = True,
 ) -> list[NDArray]:
     """
     Optimize geometries of the initial states.
@@ -586,6 +673,9 @@ def optimize_coordinates(
     minimization_configs: minimizer.MinimizationConfig, optional
         Options to define the type of minimization for the states
         Defaults to value defined by _get_default_state_minimization_configs() if None
+
+    verbose: bool
+        Print per-state progress messages during optimization.
 
     Returns
     -------
@@ -613,13 +703,13 @@ def optimize_coordinates(
 
     # go from lambda 0 -> 0.5
     if len(lhs_initial_states) > 0:
-        lhs_xs = _optimize_coords_along_states(lhs_initial_states, k, minimization_configs)
+        lhs_xs = _optimize_coords_along_states(lhs_initial_states, k, minimization_configs, verbose=verbose)
         for xs in lhs_xs:
             all_xs.append(xs)
 
     # go from lambda 1 -> 0.5 and reverse the coordinate trajectory and lambda schedule
     if len(rhs_initial_states) > 0:
-        rhs_xs = _optimize_coords_along_states(rhs_initial_states[::-1], k, minimization_configs)[::-1]
+        rhs_xs = _optimize_coords_along_states(rhs_initial_states[::-1], k, minimization_configs, verbose=verbose)[::-1]
         for xs in rhs_xs:
             all_xs.append(xs)
 
@@ -738,6 +828,8 @@ def estimate_relative_free_energy_bisection_or_hrex(*args, **kwargs) -> Simulati
     Will call `estimate_relative_free_energy_bisection` or `estimate_relative_free_energy_bisection_hrex`
     as appropriate given md_params.
 
+    Additional keyword arguments ``summary_log`` and ``checkpoint_dir`` are
+    forwarded to the underlying function.
     """
     hrex_params = kwargs["md_params"].hrex_params
 
@@ -760,6 +852,8 @@ def estimate_relative_free_energy_bisection(
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = 0.7,
     temperature: float = DEFAULT_TEMP,
+    summary_log: bool = False,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> SimulationResult:
     r"""Estimate relative free energy between mol_a and mol_b via independent simulations with a dynamic lambda schedule
     determined by successively bisecting the lambda interval between the pair of states with the greatest BAR
@@ -807,6 +901,13 @@ def estimate_relative_free_energy_bisection(
     temperature: float
         Temperature (Kelvin) to run simulation at, defaults to tmd.constants.DEFAULT_TEMP
 
+    summary_log: bool
+        When True, print clean per-phase summaries instead of verbose per-step output.
+
+    checkpoint_dir: str, Path or None
+        When set, save bisection results to this directory and attempt to load
+        them on startup to skip minimization + bisection.
+
     Returns
     -------
     SimulationResult
@@ -825,13 +926,52 @@ def estimate_relative_free_energy_bisection(
     lambda_interval = lambda_interval or (0.0, 1.0)
     lambda_min, lambda_max = lambda_interval[0], lambda_interval[1]
 
+    # TODO: rename prefix to postfix, or move to beginning of combined_prefix?
+    combined_prefix = get_mol_name(mol_a) + "_" + get_mol_name(mol_b) + "_" + prefix
+    slog = _SummaryLogger(combined_prefix, enabled=summary_log)
+    verbose = not summary_log
+
+    ckpt_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    ckpt_path = ckpt_dir / "bisection_checkpoint.pkl" if ckpt_dir is not None else None
+
+    # Try loading checkpoint
+    if ckpt_path is not None and ckpt_path.exists():
+        slog.phase_start("Checkpoint Load")
+        with open(ckpt_path, "rb") as fh:
+            ckpt = pickle.load(fh)
+        if ckpt["md_params"] == md_params and ckpt["temperature"] == temperature:
+            slog.info("Loaded bisection checkpoint, skipping minimization + bisection")
+            results = ckpt["bisection_results"]
+            trajectories = ckpt["trajectories"]
+            slog.phase_end("Checkpoint Load")
+
+            final_result = results[-1]
+            t0 = time.perf_counter()
+            plots = make_pair_bar_plots(final_result, temperature, combined_prefix)
+            if not summary_log:
+                print(f"[TIMER] mbar_analysis {time.perf_counter() - t0:.2f}s", flush=True)
+            slog.phase_end("MBAR Analysis", dG=f"{sum(final_result.dGs):.2f} kJ/mol", min_overlap=f"{min(final_result.overlaps):.3f}")
+
+            assert len(trajectories) == len(results) + 1
+            if summary_log:
+                slog.write_to_file(ckpt_dir / f"{combined_prefix}_summary.log")
+            return SimulationResult(final_result, plots, trajectories, md_params, results)
+        else:
+            slog.warning("Checkpoint md_params/temperature mismatch, re-running from scratch")
+
     lambda_grid = bisection_lambda_schedule(n_windows, lambda_interval=lambda_interval)
 
+    # -- Minimization --
+    slog.phase_start("Minimization")
     t0 = time.perf_counter()
     initial_states = setup_initial_states(
-        single_topology, host_config, temperature, lambda_grid, md_params.seed, False, min_cutoff=min_cutoff
+        single_topology, host_config, temperature, lambda_grid, md_params.seed, False,
+        min_cutoff=min_cutoff, verbose=verbose,
     )
-    print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
+    elapsed = time.perf_counter() - t0
+    if not summary_log:
+        print(f"[TIMER] minimization {elapsed:.2f}s", flush=True)
+    slog.phase_end("Minimization", states=len(initial_states))
 
     make_initial_state_fn = partial(
         setup_initial_state,
@@ -839,7 +979,7 @@ def estimate_relative_free_energy_bisection(
         host=host_config,
         temperature=temperature,
         seed=md_params.seed,
-        verify_constraints=False,  # Speeds up construction of initial state
+        verify_constraints=False,
     )
 
     make_optimized_initial_state_fn = partial(
@@ -849,10 +989,9 @@ def estimate_relative_free_energy_bisection(
 
     make_bisection_state = lambda lamb: make_optimized_initial_state_fn(make_initial_state_fn(lamb))
 
-    # TODO: rename prefix to postfix, or move to beginning of combined_prefix?
-    combined_prefix = get_mol_name(mol_a) + "_" + get_mol_name(mol_b) + "_" + prefix
-
     try:
+        # -- Bisection --
+        slog.phase_start("Bisection")
         t0 = time.perf_counter()
         results, trajectories = run_sims_bisection(
             [lambda_min, lambda_max],
@@ -861,16 +1000,52 @@ def estimate_relative_free_energy_bisection(
             n_bisections=n_windows - 2,
             temperature=temperature,
             min_overlap=min_overlap,
+            verbose=verbose,
         )
-        print(f"[TIMER] bisection {time.perf_counter() - t0:.2f}s", flush=True)
-
+        elapsed = time.perf_counter() - t0
+        if not summary_log:
+            print(f"[TIMER] bisection {elapsed:.2f}s", flush=True)
         final_result = results[-1]
+        slog.phase_end(
+            "Bisection",
+            iterations=len(results) - 1,
+            windows=len(final_result.initial_states),
+            min_overlap=f"{min(final_result.overlaps):.3f}",
+            dG=f"{sum(final_result.dGs):.2f} kJ/mol",
+        )
 
+        # Save checkpoint
+        if ckpt_path is not None:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            with open(ckpt_path, "wb") as fh:
+                pickle.dump(
+                    {
+                        "bisection_results": results,
+                        "trajectories": trajectories,
+                        "md_params": md_params,
+                        "temperature": temperature,
+                    },
+                    fh,
+                )
+            slog.info(f"Checkpoint saved to {ckpt_path}")
+
+        # -- MBAR Analysis --
+        slog.phase_start("MBAR Analysis")
         t0 = time.perf_counter()
         plots = make_pair_bar_plots(final_result, temperature, combined_prefix)
-        print(f"[TIMER] mbar_analysis {time.perf_counter() - t0:.2f}s", flush=True)
+        elapsed = time.perf_counter() - t0
+        if not summary_log:
+            print(f"[TIMER] mbar_analysis {elapsed:.2f}s", flush=True)
+        slog.phase_end(
+            "MBAR Analysis",
+            dG=f"{sum(final_result.dGs):.2f} kJ/mol",
+            min_overlap=f"{min(final_result.overlaps):.3f}",
+        )
 
         assert len(trajectories) == len(results) + 1
+
+        if summary_log and ckpt_dir is not None:
+            slog.write_to_file(ckpt_dir / f"{combined_prefix}_summary.log")
 
         return SimulationResult(
             final_result,
@@ -896,6 +1071,8 @@ def estimate_relative_free_energy_bisection_hrex_impl(
     optimize_initial_state_fn: Callable[[InitialState], InitialState],
     combined_prefix: str,
     min_overlap: Optional[float] = None,
+    summary_log: bool = False,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> HREXSimulationResult:
     """
     Parameters
@@ -929,6 +1106,12 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         If not None, terminate bisection early when the BAR overlap between all neighboring pairs of states exceeds this
         value. When given, the final number of windows may be less than or equal to n_windows.
 
+    summary_log: bool
+        When True, print clean per-phase summaries instead of verbose per-step output.
+
+    checkpoint_dir: str, Path or None
+        When set, save post-bisection/rebalance state and attempt to load on startup.
+
     Returns
     -------
     HREXSimulationResult
@@ -939,11 +1122,16 @@ def estimate_relative_free_energy_bisection_hrex_impl(
 
     assert md_params.hrex_params is not None, "hrex_params must be set to use HREX"
 
+    slog = _SummaryLogger(combined_prefix, enabled=summary_log)
+    verbose = not summary_log
+
+    ckpt_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    ckpt_path = ckpt_dir / "bisection_hrex_checkpoint.pkl" if ckpt_dir is not None else None
+
     batch_simulations = False
 
     mode_flag = os.environ.get(BATCH_MODE_ENV_VAR, None)
     if mode_flag is not None:
-        # TBD: May want to disable batching if it is clear that it would trigger an OOM
         if mode_flag.lower() == "on":
             warnings.warn("Turning on batch mode, but batch mode is already on")
             batch_simulations = True
@@ -961,102 +1149,171 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             batch_size = int(batch_flag)
             assert batch_size > 1
 
+    # Try loading checkpoint
+    loaded_from_checkpoint = False
+    if ckpt_path is not None and ckpt_path.exists():
+        slog.phase_start("Checkpoint Load")
+        try:
+            with open(ckpt_path, "rb") as fh:
+                ckpt = pickle.load(fh)
+            if ckpt["md_params"] == md_params and ckpt["temperature"] == temperature:
+                initial_states_hrex = ckpt["initial_states_hrex"]
+                results = ckpt["bisection_results"]
+                batch_simulations = ckpt["batch_simulations"]
+                loaded_from_checkpoint = True
+                slog.info("Loaded checkpoint, skipping bisection + rebalance")
+                slog.phase_end("Checkpoint Load")
+            else:
+                slog.warning("Checkpoint md_params/temperature mismatch, re-running from scratch")
+        except Exception as e:
+            slog.warning(f"Failed to load checkpoint: {e}")
+
     try:
-        # First phase: bisection to determine lambda spacing
-        md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
+        if not loaded_from_checkpoint:
+            # -- Bisection phase --
+            slog.phase_start("Bisection")
+            md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
+            make_optimized_initial_state_fn = lambda lamb: optimize_initial_state_fn(make_initial_state_fn(lamb))
 
-        # Always optimize during bisection
-        make_optimized_initial_state_fn = lambda lamb: optimize_initial_state_fn(make_initial_state_fn(lamb))
+            t0 = time.perf_counter()
+            results, trajectories_by_state = run_sims_bisection(
+                [lambda_min, lambda_max],
+                make_optimized_initial_state_fn,
+                md_params_bisection,
+                n_bisections=n_windows - 2,
+                temperature=temperature,
+                min_overlap=min_overlap,
+                batch_size=batch_size if batch_simulations else 1,
+                verbose=verbose,
+            )
+            elapsed = time.perf_counter() - t0
+            if not summary_log:
+                print(f"[TIMER] bisection {elapsed:.2f}s", flush=True)
 
-        t0 = time.perf_counter()
-        results, trajectories_by_state = run_sims_bisection(
-            [lambda_min, lambda_max],
-            make_optimized_initial_state_fn,
-            md_params_bisection,
-            n_bisections=n_windows - 2,
-            temperature=temperature,
-            min_overlap=min_overlap,
-            batch_size=batch_size if batch_simulations else 1,
-        )
-        print(f"[TIMER] bisection {time.perf_counter() - t0:.2f}s", flush=True)
+            final_bisection = results[-1]
+            slog.phase_end(
+                "Bisection",
+                iterations=len(results) - 1,
+                windows=len(final_bisection.initial_states),
+                min_overlap=f"{min(final_bisection.overlaps):.3f}",
+                dG=f"{sum(final_bisection.dGs):.2f} kJ/mol",
+            )
 
-        assert all(traj.final_velocities is not None for traj in trajectories_by_state)
+            assert all(traj.final_velocities is not None for traj in trajectories_by_state)
 
-        initial_states = results[-1].initial_states
-        has_barostat_by_state = [initial_state.barostat is not None for initial_state in initial_states]
-        assert all(has_barostat_by_state) or not any(has_barostat_by_state)
+            initial_states = results[-1].initial_states
+            has_barostat_by_state = [initial_state.barostat is not None for initial_state in initial_states]
+            assert all(has_barostat_by_state) or not any(has_barostat_by_state)
 
-        def get_mean_final_barostat_volume_scale_factor(trajectories_by_state: Iterable[Trajectory]) -> Optional[float]:
-            scale_factors = [traj.final_barostat_volume_scale_factor for traj in trajectories_by_state]
-            if any(x is not None for x in scale_factors):
-                assert all(x is not None for x in scale_factors)
-                sfs = cast(list[float], scale_factors)  # implied by assertion but required by mypy
-                return float(np.mean(sfs))
+            def get_mean_final_barostat_volume_scale_factor(trajectories_by_state: Iterable[Trajectory]) -> Optional[float]:
+                scale_factors = [traj.final_barostat_volume_scale_factor for traj in trajectories_by_state]
+                if any(x is not None for x in scale_factors):
+                    assert all(x is not None for x in scale_factors)
+                    sfs = cast(list[float], scale_factors)
+                    return float(np.mean(sfs))
+                else:
+                    return None
+
+            mean_final_barostat_volume_scale_factor = get_mean_final_barostat_volume_scale_factor(trajectories_by_state)
+            assert (mean_final_barostat_volume_scale_factor is not None) == all(has_barostat_by_state)
+
+            def get_initial_state(lamb: float) -> InitialState:
+                state_idx = get_nearest_state_idx(lamb, initial_states)
+                nearest_state = initial_states[state_idx]
+                traj = trajectories_by_state[state_idx]
+                if np.isclose(nearest_state.lamb, lamb):
+                    state = nearest_state
+                else:
+                    state = make_initial_state_fn(lamb)
+                    du_dx, _ = state.to_bound_impl().execute(traj.frames[-1], traj.boxes[-1], compute_u=False)
+                    minimizer.check_force_norm(-du_dx)
+                updated_state = replace(
+                    state,
+                    x0=traj.frames[-1],
+                    v0=traj.final_velocities,  # type: ignore
+                    box0=traj.boxes[-1],
+                    barostat=(
+                        replace(
+                            state.barostat,
+                            adaptive_scaling_enabled=False,
+                            initial_volume_scale_factor=mean_final_barostat_volume_scale_factor,
+                        )
+                        if state.barostat
+                        else None
+                    ),
+                )
+                return updated_state
+
+            # -- Lambda rebalance --
+            slog.phase_start("Lambda Rebalance")
+            t0 = time.perf_counter()
+            n_windows_before = len(initial_states)
+            if md_params.hrex_params.optimize_target_overlap is not None:
+                initial_states_hrex = rebalance_lambda_schedule(
+                    initial_states,
+                    get_initial_state,
+                    trajectories_by_state,
+                    md_params.hrex_params.optimize_target_overlap,
+                    max_windows=n_windows,
+                )
             else:
-                return None
+                initial_states_hrex = [get_initial_state(s.lamb) for s in initial_states]
+            elapsed = time.perf_counter() - t0
+            if not summary_log:
+                print(f"[TIMER] lambda_rebalance {elapsed:.2f}s", flush=True)
+            slog.phase_end(
+                "Lambda Rebalance",
+                windows=f"{n_windows_before} -> {len(initial_states_hrex)}",
+            )
 
-        mean_final_barostat_volume_scale_factor = get_mean_final_barostat_volume_scale_factor(trajectories_by_state)
-        assert (mean_final_barostat_volume_scale_factor is not None) == all(has_barostat_by_state)
-
-        def get_initial_state(lamb: float) -> InitialState:
-            state_idx = get_nearest_state_idx(lamb, initial_states)
-            nearest_state = initial_states[state_idx]
-            traj = trajectories_by_state[state_idx]
-            if np.isclose(nearest_state.lamb, lamb):
-                state = nearest_state
-            else:
-                # If the lambda value is different, reconstruct the initial state to the correct parameters
-                state = make_initial_state_fn(lamb)
-
-                # Verify that the forces of the nearest lambda value's frames are stable, since frames were not generated
-                # with the same parameters
-                du_dx, _ = state.to_bound_impl().execute(traj.frames[-1], traj.boxes[-1], compute_u=False)
-                minimizer.check_force_norm(-du_dx)
-            # Use equilibrated samples and the average of the final barostat volume scale factors from bisection phase to
-            # initialize states for HREX
-            updated_state = replace(
-                state,
-                x0=traj.frames[-1],
-                v0=traj.final_velocities,  # type: ignore
-                box0=traj.boxes[-1],
-                barostat=(
-                    replace(
-                        state.barostat,
-                        adaptive_scaling_enabled=False,
-                        initial_volume_scale_factor=mean_final_barostat_volume_scale_factor,
+            # Save checkpoint after rebalance
+            if ckpt_path is not None:
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                with open(ckpt_path, "wb") as fh:
+                    pickle.dump(
+                        {
+                            "initial_states_hrex": initial_states_hrex,
+                            "bisection_results": results,
+                            "md_params": md_params,
+                            "temperature": temperature,
+                            "combined_prefix": combined_prefix,
+                            "batch_simulations": batch_simulations,
+                        },
+                        fh,
                     )
-                    if state.barostat
-                    else None
-                ),
-            )
-            # Verify that the forces of the system are reasonable
-            return updated_state
+                slog.info(f"Checkpoint saved to {ckpt_path}")
 
-        t0 = time.perf_counter()
-        if md_params.hrex_params.optimize_target_overlap is not None:
-            initial_states_hrex = rebalance_lambda_schedule(
-                initial_states,
-                get_initial_state,
-                trajectories_by_state,
-                md_params.hrex_params.optimize_target_overlap,
-                max_windows=n_windows,
-            )
-        else:
-            initial_states_hrex = [get_initial_state(s.lamb) for s in initial_states]
-        print(f"[TIMER] lambda_rebalance {time.perf_counter() - t0:.2f}s", flush=True)
-
-        # Second phase: sample initial states determined by bisection using HREX
+        # -- HREX Production --
+        slog.phase_start("HREX Production")
         t0 = time.perf_counter()
         pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = run_sims_hrex(
             initial_states_hrex,
-            replace(md_params, n_eq_steps=0),  # using pre-equilibrated samples
+            replace(md_params, n_eq_steps=0),
             batch_simulations=batch_simulations,
+            summary_log=summary_log,
+            summary_prefix=combined_prefix,
         )
-        print(f"[TIMER] production_hrex {time.perf_counter() - t0:.2f}s", flush=True)
+        elapsed = time.perf_counter() - t0
+        if not summary_log:
+            print(f"[TIMER] production_hrex {elapsed:.2f}s", flush=True)
+        slog.phase_end(
+            "HREX Production",
+            frames=md_params.n_frames,
+            dG=f"{sum(pair_bar_result.dGs):.2f} kJ/mol",
+        )
 
+        # -- MBAR Analysis --
+        slog.phase_start("MBAR Analysis")
         t0 = time.perf_counter()
         plots = make_pair_bar_plots(pair_bar_result, temperature, combined_prefix)
-        print(f"[TIMER] mbar_analysis {time.perf_counter() - t0:.2f}s", flush=True)
+        elapsed = time.perf_counter() - t0
+        if not summary_log:
+            print(f"[TIMER] mbar_analysis {elapsed:.2f}s", flush=True)
+        slog.phase_end(
+            "MBAR Analysis",
+            dG=f"{sum(pair_bar_result.dGs):.2f} +/- {sum(pair_bar_result.dG_errs):.2f} kJ/mol",
+            min_overlap=f"{min(pair_bar_result.overlaps):.3f}",
+        )
 
         hrex_plots = HREXPlots(
             transition_matrix_png=plot_as_png_fxn(
@@ -1069,6 +1326,10 @@ def estimate_relative_free_energy_bisection_hrex_impl(
                 prefix=combined_prefix,
             ),
         )
+
+        if summary_log and ckpt_dir is not None:
+            slog.write_to_file(ckpt_dir / f"{combined_prefix}_summary.log")
+
         return HREXSimulationResult(
             pair_bar_result,
             plots,
@@ -1099,6 +1360,8 @@ def estimate_relative_free_energy_bisection_hrex(
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = 0.7,
     temperature: float = DEFAULT_TEMP,
+    summary_log: bool = False,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> HREXSimulationResult:
     """
     Estimate relative free energy between mol_a and mol_b using Hamiltonian Replica EXchange (HREX) sampling of a
@@ -1146,6 +1409,12 @@ def estimate_relative_free_energy_bisection_hrex(
     temperature: float
         Temperature (Kelvin) to run simulation at, defaults to tmd.constants.DEFAULT_TEMP
 
+    summary_log: bool
+        When True, print clean per-phase summaries instead of verbose per-step output.
+
+    checkpoint_dir: str, Path or None
+        When set, save post-bisection/rebalance state and attempt to load on startup.
+
     Returns
     -------
     HREXSimulationResult
@@ -1178,13 +1447,22 @@ def estimate_relative_free_energy_bisection_hrex(
     lambda_interval = lambda_interval or (0.0, 1.0)
     lambda_min, lambda_max = lambda_interval[0], lambda_interval[1]
 
+    combined_prefix = get_mol_name(mol_a) + "_" + get_mol_name(mol_b) + "_" + prefix
+    slog = _SummaryLogger(combined_prefix, enabled=summary_log)
+    verbose = not summary_log
+
     lambda_grid = bisection_lambda_schedule(n_windows, lambda_interval=lambda_interval)
 
+    slog.phase_start("Minimization")
     t0 = time.perf_counter()
     initial_states = setup_initial_states(
-        single_topology, host_config, temperature, lambda_grid, md_params.seed, False, min_cutoff=min_cutoff
+        single_topology, host_config, temperature, lambda_grid, md_params.seed, False,
+        min_cutoff=min_cutoff, verbose=verbose,
     )
-    print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
+    elapsed = time.perf_counter() - t0
+    if not summary_log:
+        print(f"[TIMER] minimization {elapsed:.2f}s", flush=True)
+    slog.phase_end("Minimization", states=len(initial_states))
 
     make_initial_state_fn = partial(
         setup_initial_state,
@@ -1192,16 +1470,13 @@ def estimate_relative_free_energy_bisection_hrex(
         host=host_config,
         temperature=temperature,
         seed=md_params.seed,
-        verify_constraints=False,  # Speeds up construction of initial state
+        verify_constraints=False,
     )
 
     make_optimized_initial_state_fn = partial(
         optimize_initial_state_from_pre_optimized,
         optimized_initial_states=initial_states,
     )
-
-    # TODO: rename prefix to postfix, or move to beginning of combined_prefix?
-    combined_prefix = get_mol_name(mol_a) + "_" + get_mol_name(mol_b) + "_" + prefix
 
     return estimate_relative_free_energy_bisection_hrex_impl(
         temperature,
@@ -1213,6 +1488,8 @@ def estimate_relative_free_energy_bisection_hrex(
         make_optimized_initial_state_fn,
         combined_prefix,
         min_overlap,
+        summary_log=summary_log,
+        checkpoint_dir=checkpoint_dir,
     )
 
 
@@ -1226,6 +1503,7 @@ def run_vacuum(
     n_windows: Optional[int] = None,
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = None,
+    **kwargs,
 ):
     if md_params is not None and md_params.local_md_params is not None:
         md_params = replace(md_params, local_md_params=None)
@@ -1233,7 +1511,6 @@ def run_vacuum(
     if md_params is not None and md_params.water_sampling_params is not None:
         md_params = replace(md_params, water_sampling_params=None)
         warnings.warn("Vacuum simulations don't support water sampling, disabling")
-    # min_cutoff defaults to None since there is no environment to prevent conformational changes in the ligand
     return estimate_relative_free_energy_bisection_or_hrex(
         mol_a,
         mol_b,
@@ -1245,6 +1522,7 @@ def run_vacuum(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        **kwargs,
     )
 
 
@@ -1258,6 +1536,7 @@ def run_solvent(
     n_windows: Optional[int] = None,
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = None,
+    **kwargs,
 ):
     if md_params is not None and md_params.water_sampling_params is not None:
         md_params = replace(md_params, water_sampling_params=None)
@@ -1267,8 +1546,6 @@ def run_solvent(
         box_width, forcefield.water_ff, mols=[mol_a, mol_b], box_margin=0.1
     )
     solvent_host_config = setup_optimized_host(solvent_host_config, [mol_a, mol_b], forcefield, seed=md_params.seed)
-    # min_cutoff defaults to None since the original poses tend to come from posing in a complex and
-    # in solvent the molecules may adopt significantly different poses
     solvent_res = estimate_relative_free_energy_bisection_or_hrex(
         mol_a,
         mol_b,
@@ -1280,6 +1557,7 @@ def run_solvent(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        **kwargs,
     )
     return solvent_res, solvent_host_config
 
@@ -1294,6 +1572,7 @@ def run_complex(
     n_windows: Optional[int] = None,
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = 0.7,
+    **kwargs,
 ):
     complex_host_config = builders.build_protein_system(
         protein, forcefield.protein_ff, forcefield.water_ff, mols=[mol_a, mol_b], box_margin=0.1
@@ -1310,5 +1589,6 @@ def run_complex(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        **kwargs,
     )
     return complex_res, complex_host_config
