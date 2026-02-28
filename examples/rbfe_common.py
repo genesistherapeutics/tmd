@@ -13,7 +13,13 @@ from tmd.constants import DEFAULT_ATOM_MAPPING_KWARGS, KCAL_TO_KJ
 from tmd.fe import atom_mapping
 from tmd.fe.free_energy import MDParams, compute_total_ns
 from tmd.fe.mle import infer_node_vals_and_errs_networkx
-from tmd.fe.plots import plot_as_png_fxn, plot_forward_and_reverse_dg, plot_water_proposals_by_state
+from tmd.fe.plots import (
+    plot_as_png_fxn,
+    plot_bisection_convergence_figure,
+    plot_bisection_lambda_evolution_figure,
+    plot_forward_and_reverse_dg,
+    plot_water_proposals_by_state,
+)
 from tmd.fe.rbfe import (
     HREXSimulationResult,
     run_complex,
@@ -53,17 +59,21 @@ def write_result_csvs(
         exp_a = None
         exp_b = None
         try:
-            exp_a = get_mol_experimental_value(mols_by_name[name_a], experimental_field, experimental_units)
+            exp_a = (
+                get_mol_experimental_value(mols_by_name[name_a], experimental_field, experimental_units) / KCAL_TO_KJ
+            )
             g.add_node(name_a, node_exp=exp_a)
         except KeyError:
             pass
         try:
-            exp_b = get_mol_experimental_value(mols_by_name[name_b], experimental_field, experimental_units)
+            exp_b = (
+                get_mol_experimental_value(mols_by_name[name_b], experimental_field, experimental_units) / KCAL_TO_KJ
+            )
             g.add_node(name_b, node_exp=exp_b)
         except KeyError:
             pass
         if exp_a is not None and exp_b is not None:
-            edge["exp_ddg (kcal/mol)"] = (exp_b - exp_a) / KCAL_TO_KJ
+            edge["exp_ddg (kcal/mol)"] = exp_b - exp_a
 
         if COMPLEX_LEG in leg_summaries and SOLVENT_LEG in leg_summaries:
             edge["pred_ddg (kcal/mol)"] = (
@@ -104,9 +114,9 @@ def write_result_csvs(
                     [
                         n,
                         Chem.MolToSmiles(Chem.RemoveHs(mols_by_name[n])),
-                        data["inferred_dg"] / KCAL_TO_KJ if "inferred_dg" in data else "",
-                        data["inferred_dg_stddev"] / KCAL_TO_KJ if "inferred_dg" in data else "",
-                        data["node_exp"] / KCAL_TO_KJ if "node_exp" in data else "",
+                        data["inferred_dg"] if "inferred_dg" in data else "",
+                        data["inferred_dg_stddev"] if "inferred_dg" in data else "",
+                        data["node_exp"] if "node_exp" in data else "",
                     ]
                 )
         for edge in edge_records.values():
@@ -144,6 +154,8 @@ def run_rbfe_leg(
     min_overlap: float,
     write_trajectories: bool,
     force_overwrite: bool,
+    summary_log: bool = False,
+    checkpoint_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run an RBFE leg (vacuum, solvent, or complex).
 
@@ -223,6 +235,14 @@ def run_rbfe_leg(
     np.random.seed(md_params.seed)
     start = time.perf_counter()
     host_config = None
+
+    leg_ckpt_dir = None
+    if checkpoint_dir is not None:
+        leg_ckpt_dir = Path(file_client.full_path(Path(edge_path) / leg_name))
+        leg_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    extra_kwargs: dict[str, Any] = dict(summary_log=summary_log, checkpoint_dir=leg_ckpt_dir)
+
     if leg_name == VACUUM_LEG:
         res = run_vacuum(
             mol_a,
@@ -233,6 +253,7 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
+            **extra_kwargs,
         )
     elif leg_name == SOLVENT_LEG:
         res, host_config = run_solvent(
@@ -244,6 +265,7 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
+            **extra_kwargs,
         )
     elif leg_name == COMPLEX_LEG:
         assert pdb_path is not None, "No pdb data provided"
@@ -256,11 +278,13 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
+            **extra_kwargs,
         )
     else:
         assert 0, f"Invalid leg: {leg_name}"
     took = time.perf_counter() - start
 
+    combined_prefix = f"{get_mol_name(mol_a)}_{get_mol_name(mol_b)}_{leg_name}"
     pred_dg = float(np.sum(res.final_result.dGs))
     pred_dg_err = float(np.linalg.norm(res.final_result.dG_errs))
     print(
@@ -316,6 +340,17 @@ def run_rbfe_leg(
                     res.water_sampling_diagnostics.cumulative_proposals_by_state,
                 ),
             )
+    if len(res.intermediate_results) > 0:
+        min_overlaps = [min(r.overlaps) for r in res.intermediate_results]
+        file_client.store(
+            leg_path / "bisection_convergence.png",
+            plot_as_png_fxn(plot_bisection_convergence_figure, min_overlaps, prefix=combined_prefix),
+        )
+        file_client.store(
+            leg_path / "bisection_lambda_evolution.png",
+            plot_as_png_fxn(plot_bisection_lambda_evolution_figure, res.intermediate_results, prefix=combined_prefix),
+        )
+
     file_client.store(leg_path / "dg_errors.png", res.plots.dG_errs_png)
     file_client.store(leg_path / "overlap_summary.png", res.plots.overlap_summary_png)
     u_kln_by_lambda = res.final_result.u_kln_by_component_by_lambda.sum(1)

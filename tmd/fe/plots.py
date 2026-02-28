@@ -1175,3 +1175,54 @@ def plot_retrospective_comparison(
     ax.set_aspect("equal", "box")
     plt.savefig(str(output_path), bbox_inches="tight", dpi=150)
     plt.clf()
+
+
+def plot_bisection_convergence_figure(
+    min_overlaps_by_iter: Sequence[float],
+    target_overlap: float | None = None,
+    prefix: str = "",
+):
+    """Min BAR overlap vs bisection iteration."""
+    fig, ax = plt.subplots(figsize=(8, 4))
+    iters = list(range(len(min_overlaps_by_iter)))
+    ax.plot(iters, min_overlaps_by_iter, "o-", markersize=4)
+    if target_overlap is not None:
+        ax.axhline(target_overlap, color="r", linestyle="--", label=f"target={target_overlap:.3f}")
+        ax.legend()
+    ax.set_xlabel("Bisection iteration")
+    ax.set_ylabel("Min BAR overlap")
+    ax.set_ylim(0, 1)
+    ax.set_title(f"{prefix} Bisection Convergence" if prefix else "Bisection Convergence")
+    fig.tight_layout()
+    return fig
+
+
+def plot_bisection_lambda_evolution_figure(
+    results_list,
+    prefix: str = "",
+):
+    """Lambda schedule evolution across bisection iterations, colored by pairwise overlap."""
+    fig, ax = plt.subplots(figsize=(10, 4))
+    for i, result in enumerate(results_list):
+        lambdas = [s.lamb for s in result.initial_states]
+        overlaps = result.overlaps
+        midpoints = [(lambdas[j] + lambdas[j + 1]) / 2.0 for j in range(len(overlaps))]
+        scatter = ax.scatter(
+            midpoints,
+            [i] * len(midpoints),
+            c=overlaps,
+            vmin=0,
+            vmax=1,
+            cmap="RdYlGn",
+            s=20,
+            edgecolors="none",
+        )
+        for lam in lambdas:
+            ax.plot(lam, i, "|", color="black", markersize=6, markeredgewidth=0.5)
+    ax.set_xlabel("Lambda")
+    ax.set_ylabel("Bisection iteration")
+    ax.set_title(f"{prefix} Lambda Schedule Evolution" if prefix else "Lambda Schedule Evolution")
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("BAR overlap")
+    fig.tight_layout()
+    return fig

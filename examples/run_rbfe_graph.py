@@ -91,6 +91,16 @@ def main():
         help="Overwrite existing predictions, otherwise will skip the completed legs",
     )
     parser.add_argument(
+        "--summary_log",
+        action="store_true",
+        help="Print clean per-phase summaries instead of verbose per-step output",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help="Enable checkpointing of bisection/rebalance results for resumption",
+    )
+    parser.add_argument(
         "--experimental_field", default="kcal/mol experimental dG", help="Field that contains the experimental label."
     )
     parser.add_argument(
@@ -189,6 +199,8 @@ def main():
                 args.min_overlap,
                 args.store_trajectories,
                 args.force_overwrite,
+                args.summary_log,
+                str(dest_dir) if args.checkpoint else None,
             )
             future_id_to_leg[fut.id] = (edge["mol_a"], edge["mol_b"], leg_name)
             futures.append(fut)
