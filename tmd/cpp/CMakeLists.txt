@@ -70,7 +70,7 @@ endif()
 
 set(EIGEN_SRC_DIR eigen)
 if(NOT EXISTS ${EIGEN_SRC_DIR})
-  execute_process(COMMAND git clone --depth 1 --branch 3.3.9 https://gitlab.com/libeigen/eigen.git ${EIGEN_SRC_DIR})
+  execute_process(COMMAND git clone --depth 1 --branch 3.3.9 https://github.com/eigenteam/eigen-git-mirror.git ${EIGEN_SRC_DIR})
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_BINARY_DIR}/${PYBIND_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/${PYBIND_SRC_DIR})
