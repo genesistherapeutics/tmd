@@ -17,7 +17,6 @@ import io
 import multiprocessing
 import os
 import pickle
-import sys
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
@@ -39,9 +38,6 @@ class BaseFuture(ABC):
 
     @abstractmethod
     def result(self) -> Any: ...
-
-    @abstractmethod
-    def cancel(self) -> bool: ...
 
     @property
     @abstractmethod
@@ -118,9 +114,6 @@ class _MockFuture(BaseFuture):
     def done(self) -> bool:
         return True
 
-    def cancel(self) -> bool:
-        return False
-
     @property
     def id(self) -> str:
         """
@@ -146,9 +139,6 @@ class WrappedFuture(BaseFuture):
 
     def done(self) -> bool:
         return self._future.done()
-
-    def cancel(self) -> bool:
-        return self._future.cancel()
 
     @property
     def id(self) -> str:
@@ -188,10 +178,9 @@ class ProcessPoolClient(AbstractClient):
         self._idx = 0
         self._total_idx = 0
         ctxt = multiprocessing.get_context("spawn")
-        executor_kwargs: dict = dict(max_workers=self.max_workers, mp_context=ctxt)
-        if sys.version_info >= (3, 11):
-            executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
-        self.executor = futures.ProcessPoolExecutor(**executor_kwargs)
+        self.executor = futures.ProcessPoolExecutor(
+            max_workers=self.max_workers, mp_context=ctxt, max_tasks_per_child=max_tasks_per_child
+        )
 
     def submit(self, task_fn, *args, **kwargs) -> BaseFuture:
         """
@@ -355,9 +344,6 @@ class BinaryFutureWrapper:
 
     def done(self) -> bool:
         return self._future.done()
-
-    def cancel(self) -> bool:
-        return self._future.cancel()
 
     @property
     def id(self) -> str:
