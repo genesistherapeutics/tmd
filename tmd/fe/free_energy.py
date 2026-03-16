@@ -2065,6 +2065,8 @@ def run_sims_hrex(
     n_swap_attempts_per_iter: Optional[int] = None,
     print_diagnostics_interval: Optional[int] = 10,
     batch_simulations: bool = False,
+    summary_log: bool = False,
+    summary_prefix: str = "",
 ) -> tuple[PairBarResult, list[Trajectory], HREXDiagnostics, WaterSamplingDiagnostics | None]:
     r"""Sample from a sequence of states using nearest-neighbor Hamiltonian Replica EXchange (HREX).
 
@@ -2087,6 +2089,13 @@ def run_sims_hrex(
 
     batch_simulations: bool
         Run simulations in batch mode. May result in GPU running out of memory
+
+    summary_log: bool
+        When True, replace per-frame diagnostics with wall-clock-based progress
+        updates roughly every 10 minutes.
+
+    summary_prefix: str
+        Prefix for summary log output lines.
 
     Returns
     -------
@@ -2221,15 +2230,33 @@ def run_sims_hrex(
 
         fraction_accepted_by_pair_by_iter.append(fraction_accepted_by_pair)
 
-        if print_diagnostics_interval and (current_frame + 1) % print_diagnostics_interval == 0:
-            current_time = time.perf_counter()
+        current_time = time.perf_counter()
 
-            def get_swap_acceptance_rates(fraction_accepted_by_pair):
-                return [
-                    n_accepted / n_proposed if n_proposed else np.nan
-                    for n_accepted, n_proposed in fraction_accepted_by_pair
-                ]
+        def get_swap_acceptance_rates(fraction_accepted_by_pair):
+            return [
+                n_accepted / n_proposed if n_proposed else np.nan
+                for n_accepted, n_proposed in fraction_accepted_by_pair
+            ]
 
+        if summary_log:
+            _SUMMARY_LOG_INTERVAL_S = 600.0  # ~10 minutes
+            if current_time - last_update_time >= _SUMMARY_LOG_INTERVAL_S or current_frame == md_params.n_frames - 1:
+                wall_elapsed = current_time - begin_loop_time
+                wall_time_per_frame_average = wall_elapsed / (current_frame + 1)
+                estimated_remaining = wall_time_per_frame_average * (md_params.n_frames - (current_frame + 1))
+                avg_rates = get_swap_acceptance_rates(np.sum(fraction_accepted_by_pair_by_iter, axis=0))
+                mean_acceptance = np.nanmean(avg_rates) * 100.0
+                elapsed_m = int(wall_elapsed // 60)
+                remaining_m = int(estimated_remaining // 60)
+                fps = 1.0 / wall_time_per_frame_average if wall_time_per_frame_average > 0 else 0.0
+                print(
+                    f"[{summary_prefix}]   [{elapsed_m}m] Frame {current_frame + 1}/{md_params.n_frames} "
+                    f"| {fps:.2f} frames/s | ~{remaining_m}m remaining | Avg acceptance: {mean_acceptance:.1f}%",
+                    flush=True,
+                )
+                last_update_time = current_time
+
+        elif print_diagnostics_interval and (current_frame + 1) % print_diagnostics_interval == 0:
             instantaneous_swap_acceptance_rates = get_swap_acceptance_rates(fraction_accepted_by_pair)
             average_swap_acceptance_rates = get_swap_acceptance_rates(np.sum(fraction_accepted_by_pair_by_iter, axis=0))
 
@@ -2252,11 +2279,6 @@ def run_sims_hrex(
             print("HREX acceptance rates, current:", format_rates(instantaneous_swap_acceptance_rates))
             print("HREX acceptance rates, average:", format_rates(average_swap_acceptance_rates))
             print("HREX replica permutation      :", hrex.replica_idx_by_state)
-            # (fey): Easily compute MBAR estimate from the u_kln. Could be used in the future to terminate early
-            # in the case that estimates have converged
-            # assert current_frame > 0
-            # df, df_err = df_and_err_from_u_kln(iterated_u_kln.sum(0)[:, :, : current_frame + 1])
-            # print(f"HREX dG (kJ/mol) Estimate {df * kBT:.2f} dG Error {df_err * kBT:.2f}")
             print()
 
             last_update_time = current_time
