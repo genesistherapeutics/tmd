@@ -13,7 +13,13 @@ from tmd.constants import DEFAULT_ATOM_MAPPING_KWARGS, KCAL_TO_KJ
 from tmd.fe import atom_mapping
 from tmd.fe.free_energy import MDParams, compute_total_ns
 from tmd.fe.mle import infer_node_vals_and_errs_networkx
-from tmd.fe.plots import plot_as_png_fxn, plot_forward_and_reverse_dg, plot_water_proposals_by_state
+from tmd.fe.plots import (
+    plot_as_png_fxn,
+    plot_bisection_convergence_figure,
+    plot_bisection_lambda_evolution_figure,
+    plot_forward_and_reverse_dg,
+    plot_water_proposals_by_state,
+)
 from tmd.fe.rbfe import (
     HREXSimulationResult,
     run_complex,
@@ -265,6 +271,7 @@ def run_rbfe_leg(
         assert 0, f"Invalid leg: {leg_name}"
     took = time.perf_counter() - start
 
+    combined_prefix = f"{get_mol_name(mol_a)}_{get_mol_name(mol_b)}_{leg_name}"
     pred_dg = float(np.sum(res.final_result.dGs))
     pred_dg_err = float(np.linalg.norm(res.final_result.dG_errs))
     print(
@@ -320,6 +327,17 @@ def run_rbfe_leg(
                     res.water_sampling_diagnostics.cumulative_proposals_by_state,
                 ),
             )
+    if len(res.intermediate_results) > 0:
+        min_overlaps = [min(r.overlaps) for r in res.intermediate_results]
+        file_client.store(
+            leg_path / "bisection_convergence.png",
+            plot_as_png_fxn(plot_bisection_convergence_figure, min_overlaps, prefix=combined_prefix),
+        )
+        file_client.store(
+            leg_path / "bisection_lambda_evolution.png",
+            plot_as_png_fxn(plot_bisection_lambda_evolution_figure, res.intermediate_results, prefix=combined_prefix),
+        )
+
     file_client.store(leg_path / "dg_errors.png", res.plots.dG_errs_png)
     file_client.store(leg_path / "overlap_summary.png", res.plots.overlap_summary_png)
     u_kln_by_lambda = res.final_result.u_kln_by_component_by_lambda.sum(1)
@@ -329,4 +347,14 @@ def run_rbfe_leg(
     )
     # Contains initial states and the complete u_kln
     file_client.store(leg_path / "final_pairbar_result.pkl", pickle.dumps(res.final_result))
+
+    log_path = Path(file_client.full_path(leg_path / "timing.log"))
+    with open(log_path, "w") as f:
+        f.write(f"edge: {get_mol_name(mol_a)} -> {get_mol_name(mol_b)}\n")
+        f.write(f"leg: {leg_name}\n")
+        f.write(f"total_time: {took:.2f}s\n")
+        f.write(f"pred_dg (kJ/mol): {pred_dg:.2f} +/- {pred_dg_err:.2f}\n")
+        f.write(f"n_windows: {len(res.final_result.initial_states)}\n")
+        f.write(f"min_overlap: {min(res.final_result.overlaps):.3f}\n")
+
     return summary_data

@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import pickle
+import time
 import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -826,9 +827,11 @@ def estimate_relative_free_energy_bisection(
 
     lambda_grid = bisection_lambda_schedule(n_windows, lambda_interval=lambda_interval)
 
+    t0 = time.perf_counter()
     initial_states = setup_initial_states(
         single_topology, host_config, temperature, lambda_grid, md_params.seed, False, min_cutoff=min_cutoff
     )
+    print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
 
     make_initial_state_fn = partial(
         setup_initial_state,
@@ -850,6 +853,7 @@ def estimate_relative_free_energy_bisection(
     combined_prefix = get_mol_name(mol_a) + "_" + get_mol_name(mol_b) + "_" + prefix
 
     try:
+        t0 = time.perf_counter()
         results, trajectories = run_sims_bisection(
             [lambda_min, lambda_max],
             make_bisection_state,
@@ -858,10 +862,13 @@ def estimate_relative_free_energy_bisection(
             temperature=temperature,
             min_overlap=min_overlap,
         )
+        print(f"[TIMER] bisection {time.perf_counter() - t0:.2f}s", flush=True)
 
         final_result = results[-1]
 
+        t0 = time.perf_counter()
         plots = make_pair_bar_plots(final_result, temperature, combined_prefix)
+        print(f"[TIMER] mbar_analysis {time.perf_counter() - t0:.2f}s", flush=True)
 
         assert len(trajectories) == len(results) + 1
 
@@ -961,6 +968,7 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         # Always optimize during bisection
         make_optimized_initial_state_fn = lambda lamb: optimize_initial_state_fn(make_initial_state_fn(lamb))
 
+        t0 = time.perf_counter()
         results, trajectories_by_state = run_sims_bisection(
             [lambda_min, lambda_max],
             make_optimized_initial_state_fn,
@@ -970,6 +978,7 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             min_overlap=min_overlap,
             batch_size=batch_size if batch_simulations else 1,
         )
+        print(f"[TIMER] bisection {time.perf_counter() - t0:.2f}s", flush=True)
 
         assert all(traj.final_velocities is not None for traj in trajectories_by_state)
 
@@ -1023,6 +1032,7 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             # Verify that the forces of the system are reasonable
             return updated_state
 
+        t0 = time.perf_counter()
         if md_params.hrex_params.optimize_target_overlap is not None:
             initial_states_hrex = rebalance_lambda_schedule(
                 initial_states,
@@ -1033,15 +1043,20 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             )
         else:
             initial_states_hrex = [get_initial_state(s.lamb) for s in initial_states]
+        print(f"[TIMER] lambda_rebalance {time.perf_counter() - t0:.2f}s", flush=True)
 
         # Second phase: sample initial states determined by bisection using HREX
+        t0 = time.perf_counter()
         pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = run_sims_hrex(
             initial_states_hrex,
             replace(md_params, n_eq_steps=0),  # using pre-equilibrated samples
             batch_simulations=batch_simulations,
         )
+        print(f"[TIMER] production_hrex {time.perf_counter() - t0:.2f}s", flush=True)
 
+        t0 = time.perf_counter()
         plots = make_pair_bar_plots(pair_bar_result, temperature, combined_prefix)
+        print(f"[TIMER] mbar_analysis {time.perf_counter() - t0:.2f}s", flush=True)
 
         hrex_plots = HREXPlots(
             transition_matrix_png=plot_as_png_fxn(
@@ -1164,9 +1179,12 @@ def estimate_relative_free_energy_bisection_hrex(
     lambda_min, lambda_max = lambda_interval[0], lambda_interval[1]
 
     lambda_grid = bisection_lambda_schedule(n_windows, lambda_interval=lambda_interval)
+
+    t0 = time.perf_counter()
     initial_states = setup_initial_states(
         single_topology, host_config, temperature, lambda_grid, md_params.seed, False, min_cutoff=min_cutoff
     )
+    print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
 
     make_initial_state_fn = partial(
         setup_initial_state,
