@@ -91,6 +91,16 @@ def main():
         help="Overwrite existing predictions, otherwise will skip the completed legs",
     )
     parser.add_argument(
+        "--summary_log",
+        action="store_true",
+        help="Print clean per-phase summaries instead of verbose per-step output",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help="Enable checkpointing of bisection/rebalance results for resumption",
+    )
+    parser.add_argument(
         "--experimental_field", default="kcal/mol experimental dG", help="Field that contains the experimental label."
     )
     parser.add_argument(
@@ -142,6 +152,7 @@ def main():
     pool.verify()
     futures = []
     future_id_to_leg = {}
+    edge_to_futures: dict[tuple[str, str], list] = defaultdict(list)
     for edge in edges_data:
         mol_a = mols_by_name[edge["mol_a"]]
         mol_b = mols_by_name[edge["mol_b"]]
@@ -173,6 +184,7 @@ def main():
         )
         # Shuffle the order of the legs to improve load balancing of work in different GPUs
         rng.shuffle(args.legs)
+        edge_key = (edge["mol_a"], edge["mol_b"])
         for leg_name in args.legs:
             fut = pool.submit(
                 run_rbfe_leg,
@@ -189,16 +201,30 @@ def main():
                 args.min_overlap,
                 args.store_trajectories,
                 args.force_overwrite,
+                args.summary_log,
+                str(dest_dir) if args.checkpoint else None,
             )
             future_id_to_leg[fut.id] = (edge["mol_a"], edge["mol_b"], leg_name)
             futures.append(fut)
+            edge_to_futures[edge_key].append(fut)
     leg_results = defaultdict(dict)
+    failed_edges: set[tuple[str, str]] = set()
     for fut in iterate_completed_futures(futures):
         mol_a, mol_b, leg = future_id_to_leg[fut.id]
+        edge_key = (mol_a, mol_b)
+
+        if edge_key in failed_edges:
+            print(f"Skipping leg {leg} ({mol_a} -> {mol_b}): sibling leg already failed")
+            continue
+
         try:
             data = fut.result()
         except Exception as e:
             print(f"Leg {leg} ({mol_a} -> {mol_b}) failed: {e}")
+            failed_edges.add(edge_key)
+            cancelled = sum(sib.cancel() for sib in edge_to_futures[edge_key] if not sib.done())
+            if cancelled:
+                print(f"  Cancelled {cancelled} pending sibling leg(s) for edge {mol_a} -> {mol_b}")
             continue
         leg_results[(mol_a, mol_b)][leg] = data
 
