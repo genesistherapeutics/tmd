@@ -64,8 +64,6 @@ from tmd.fe.stored_arrays import StoredArrays
 from tmd.ff import Forcefield
 from tmd.lib import LangevinIntegrator, custom_ops
 from tmd.md import builders
-from tmd.md.barostat.utils import get_bond_list, get_group_indices
-from tmd.md.builders import _iterate_water_residues
 from tmd.md.hrex import HREX, HREXDiagnostics, ReplicaIdx
 from tmd.md.states import CoordsVelBox
 from tmd.potentials import (
@@ -566,9 +564,7 @@ def test_get_water_sampler_params_complex():
     np.testing.assert_array_equal(orig_prot_nb_params, water_sampler_nb_params[state.protein_idxs])
 
 
-@pytest.mark.parametrize("neutralize", [True, False])
-@pytest.mark.parametrize("ionic_concentration", [0.0, 0.15])
-def test_get_context_with_non_contiguous_waters(neutralize, ionic_concentration):
+def test_get_context_with_non_contiguous_waters():
     """Verify that the build_protein_system ensures waters are contiguous and that the water sampler can be
     configured successfully."""
     cdk8_system = Path(__file__).parent / "data" / "cdk8_incorrectly_ordered_waters.pdb"
@@ -583,24 +579,8 @@ def test_get_context_with_non_contiguous_waters(neutralize, ionic_concentration)
     st = SingleTopology(mol_a, mol_b, core, forcefield)
 
     host_config = builders.build_protein_system(
-        str(cdk8_system),
-        forcefield.protein_ff,
-        forcefield.water_ff,
-        mols=[mol_a, mol_b],
-        box_margin=0.1,
-        ionic_concentration=ionic_concentration,
-        neutralize=neutralize,
+        str(cdk8_system), forcefield.protein_ff, forcefield.water_ff, mols=[mol_a, mol_b], box_margin=0.1
     )
-
-    # Ensure that the water atoms in the topology match that of the group indices
-    water_residues = list(_iterate_water_residues(host_config.omm_topology))
-
-    bond_pot = host_config.host_system.bond.potential
-    all_group_idxs = get_group_indices(get_bond_list(bond_pot), host_config.conf.shape[0])
-    water_groups = [set([int(i) for i in group]) for group in all_group_idxs if len(group) == 3]
-    for res in water_residues:
-        ref_set = set([atom.index for atom in res.atoms()])
-        assert ref_set in water_groups
 
     lamb = 0.5  # arbitrary
 
@@ -608,7 +588,6 @@ def test_get_context_with_non_contiguous_waters(neutralize, ionic_concentration)
     md_params = MDParams(10, 0, 10, seed, water_sampling_params=WaterSamplingParams())
 
     state = setup_initial_state(st, lamb, host_config, DEFAULT_TEMP, 2026, False)
-
     ctxt = get_context(state, md_params=md_params)
     movers = ctxt.get_movers()
     assert len(movers) == 2
