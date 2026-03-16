@@ -108,7 +108,8 @@ setup(
     packages=find_packages(),
     python_requires=">=3.12",
     install_requires=[
-        "jax[cuda12]",
+        "jax",
+        "jaxlib>0.4.1",
         "networkx",
         "numpy",
         "rdkit",
