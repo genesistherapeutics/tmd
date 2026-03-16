@@ -21,12 +21,10 @@ namespace tmd {
 template <typename RealType, bool COMPUTE_U, bool COMPUTE_DU_DX,
           bool COMPUTE_DU_DP>
 void __global__ k_chiral_atom_restraint(
-    const int N,
-    const int R,                         // number of restraints
-    const RealType *__restrict__ coords, // [N, 3]
+    const int R, // number of restraints
+    const RealType *__restrict__ coords,
     const RealType *__restrict__ params, // [R]
     const int *__restrict__ idxs,        // [R, 4]
-    const int *__restrict__ system_idxs, // [R]
     unsigned long long *__restrict__ du_dx,
     unsigned long long *__restrict__ du_dp, __int128 *__restrict__ u) {
 
@@ -36,13 +34,10 @@ void __global__ k_chiral_atom_restraint(
     return;
   }
 
-  const int system_idx = system_idxs[r_idx];
-  const int coord_offset = system_idx * N;
-
-  const int xc_idx = idxs[r_idx * 4 + 0] + coord_offset;
-  const int x1_idx = idxs[r_idx * 4 + 1] + coord_offset;
-  const int x2_idx = idxs[r_idx * 4 + 2] + coord_offset;
-  const int x3_idx = idxs[r_idx * 4 + 3] + coord_offset;
+  int xc_idx = idxs[r_idx * 4 + 0];
+  int x1_idx = idxs[r_idx * 4 + 1];
+  int x2_idx = idxs[r_idx * 4 + 2];
+  int x3_idx = idxs[r_idx * 4 + 3];
 
   // static_casts are needed to prevent compiler from complaining from
   // double->float
@@ -120,13 +115,11 @@ void __global__ k_chiral_atom_restraint(
 template <typename RealType, bool COMPUTE_U, bool COMPUTE_DU_DX,
           bool COMPUTE_DU_DP>
 void __global__ k_chiral_bond_restraint(
-    const int N, // Number of atoms per system
     const int R, // number of restraints
     const RealType *__restrict__ coords,
     const RealType *__restrict__ params, // [R]
     const int *__restrict__ idxs,        // [R, 2]
     const int *__restrict__ signs,       // [R]
-    const int *__restrict__ system_idxs, // [R]
     unsigned long long *__restrict__ du_dx,
     unsigned long long *__restrict__ du_dp, __int128 *__restrict__ u) {
 
@@ -136,12 +129,10 @@ void __global__ k_chiral_bond_restraint(
     return;
   }
 
-  const int coord_offset = system_idxs[r_idx] * N;
-
-  const int x0_idx = idxs[r_idx * 4 + 0] + coord_offset;
-  const int x1_idx = idxs[r_idx * 4 + 1] + coord_offset;
-  const int x2_idx = idxs[r_idx * 4 + 2] + coord_offset;
-  const int x3_idx = idxs[r_idx * 4 + 3] + coord_offset;
+  int x0_idx = idxs[r_idx * 4 + 0];
+  int x1_idx = idxs[r_idx * 4 + 1];
+  int x2_idx = idxs[r_idx * 4 + 2];
+  int x3_idx = idxs[r_idx * 4 + 3];
 
   // static_casts are needed to prevent compiler from complaining from
   // double->float
@@ -162,7 +153,7 @@ void __global__ k_chiral_bond_restraint(
   RealType vol;
   RealType k_restr = params[r_idx];
 
-  const int sign = signs[r_idx];
+  int sign = signs[r_idx];
 
   torsion_vol_and_grad(x0, x1, x2, x3, vol, x0_grad, x1_grad, x2_grad, x3_grad);
 

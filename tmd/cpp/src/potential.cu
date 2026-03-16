@@ -1,5 +1,4 @@
 // Copyright 2019-2025, Relay Therapeutics
-// Modifications Copyright 2025, Forrest York
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +31,7 @@ void Potential<RealType>::execute_batch_device(
   for (int i = 0; i < coord_batch_size; i++) {
     for (int j = 0; j < param_batch_size; j++) {
       unsigned int offset_factor = (i * param_batch_size) + j;
-      this->execute_device(1, N, P, d_x + (i * N * D),
+      this->execute_device(N, P, d_x + (i * N * D),
                            P > 0 ? d_p + (j * P) : nullptr, d_box + (i * D * D),
                            d_du_dx ? d_du_dx + (offset_factor * N * D)
                                    : nullptr,
@@ -54,7 +53,7 @@ void Potential<RealType>::execute_batch_sparse_device(
     int ic = coords_batch_idxs[i];
     int ip = params_batch_idxs[i];
     this->execute_device(
-        1, N, P, d_x + (ic * N * D), P > 0 ? d_p + (ip * P) : nullptr,
+        N, P, d_x + (ic * N * D), P > 0 ? d_p + (ip * P) : nullptr,
         d_box + (ic * D * D), d_du_dx ? d_du_dx + (i * N * D) : nullptr,
         d_du_dp ? d_du_dp + (i * P) : nullptr, d_u ? d_u + i : nullptr, stream);
   }
@@ -210,21 +209,19 @@ void Potential<RealType>::execute_batch_sparse_host(
 }
 
 template <typename RealType>
-void Potential<RealType>::execute_host(
-    const int batches, const int N, const int P,
-    const RealType *h_x, // [batches, N,3]
-    const RealType
-        *h_p, // [P,] // Will include batching, but concatenates all the params
-    const RealType *h_box,       // [batches, 3, 3]
-    unsigned long long *h_du_dx, // [batches, N,3]
-    unsigned long long *h_du_dp, // [P]
-    __int128 *h_u                // [batches]
+void Potential<RealType>::execute_host(const int N, const int P,
+                                       const RealType *h_x,         // [N,3]
+                                       const RealType *h_p,         // [P,]
+                                       const RealType *h_box,       // [3, 3]
+                                       unsigned long long *h_du_dx, // [N,3]
+                                       unsigned long long *h_du_dp, // [P]
+                                       __int128 *h_u                // [1]
 ) {
 
   const int &D = Potential<RealType>::D;
 
-  DeviceBuffer<RealType> d_x(batches * N * D);
-  DeviceBuffer<RealType> d_box(batches * D * D);
+  DeviceBuffer<RealType> d_x(N * D);
+  DeviceBuffer<RealType> d_box(D * D);
 
   d_x.copy_from(h_x);
   d_box.copy_from(h_box);
@@ -246,7 +243,7 @@ void Potential<RealType>::execute_host(
   // very important that these are initialized to zero since the kernels
   // themselves just accumulate
   if (h_du_dx) {
-    d_du_dx.realloc(batches * N * D);
+    d_du_dx.realloc(N * D);
     gpuErrchk(cudaMemsetAsync(d_du_dx.data, 0, d_du_dx.size(), stream));
   }
   if (h_du_dp) {
@@ -254,12 +251,12 @@ void Potential<RealType>::execute_host(
     gpuErrchk(cudaMemsetAsync(d_du_dp.data, 0, d_du_dp.size(), stream));
   }
   if (h_u) {
-    d_u.realloc(batches);
+    d_u.realloc(1);
     gpuErrchk(cudaMemsetAsync(d_u.data, 0, d_u.size(), stream));
   }
 
-  this->execute_device(batches, N, P, d_x.data, P > 0 ? d_p.data : nullptr,
-                       d_box.data, d_du_dx.length > 0 ? d_du_dx.data : nullptr,
+  this->execute_device(N, P, d_x.data, P > 0 ? d_p.data : nullptr, d_box.data,
+                       d_du_dx.length > 0 ? d_du_dx.data : nullptr,
                        d_du_dp.length > 0 ? d_du_dp.data : nullptr,
                        d_u.length > 0 ? d_u.data : nullptr, stream);
   gpuErrchk(cudaStreamSynchronize(stream));
@@ -297,7 +294,7 @@ void Potential<RealType>::execute_host_du_dx(const int N, const int P,
 
   gpuErrchk(cudaMemset(d_du_dx.data, 0, d_du_dx.size()));
 
-  this->execute_device(1, N, P, d_x.data, d_p.data, d_box.data, d_du_dx.data,
+  this->execute_device(N, P, d_x.data, d_p.data, d_box.data, d_du_dx.data,
                        nullptr, nullptr, static_cast<cudaStream_t>(0));
 
   d_du_dx.copy_to(h_du_dx);
@@ -310,10 +307,6 @@ void Potential<RealType>::du_dp_fixed_to_float(const int N, const int P,
   for (int i = 0; i < P; i++) {
     du_dp_float[i] = FIXED_TO_FLOAT<RealType>(du_dp[i]);
   }
-}
-
-template <typename RealType> int Potential<RealType>::num_systems() const {
-  return 1; // Hardcoded to 1
 }
 
 template class Potential<double>;

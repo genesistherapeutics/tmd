@@ -1,5 +1,4 @@
 # Copyright 2019-2025, Relay Therapeutics
-# Modifications Copyright 2026, Forrest York
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +26,6 @@ from .potentials import (
     ChiralBondRestraint,
     FanoutSummedPotential,
     FlatBottomBond,
-    FlatBottomRestraint,
     HarmonicAngle,
     HarmonicBond,
     LogFlatBottomBond,
@@ -50,7 +48,6 @@ __all__ = [
     "ChiralBondRestraint",
     "FanoutSummedPotential",
     "FlatBottomBond",
-    "FlatBottomRestraint",
     "GpuImplWrapper_f32",
     "GpuImplWrapper_f64",
     "HarmonicAngle",

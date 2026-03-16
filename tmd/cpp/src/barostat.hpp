@@ -18,7 +18,6 @@
 
 #include "bound_potential.hpp"
 #include "curand_kernel.h"
-#include "energy_accum.hpp"
 #include "mover.hpp"
 #include "streamed_potential_runner.hpp"
 #include <memory>
@@ -41,10 +40,10 @@ public:
   ~MonteCarloBarostat();
 
   // move() may modify d_x and d_box
-  virtual void move(const int num_systems, const int N, RealType *d_x,
-                    RealType *d_box, cudaStream_t stream) override;
+  virtual void move(const int N, RealType *d_x, RealType *d_box,
+                    cudaStream_t stream) override;
 
-  std::vector<RealType> get_volume_scale_factor() const;
+  RealType get_volume_scale_factor();
 
   void set_volume_scale_factor(const RealType volume_scale_factor);
 
@@ -79,6 +78,9 @@ protected:
 
   int num_grouped_atoms_;
 
+  size_t sum_storage_bytes_;
+  void *d_sum_temp_storage_;
+
   int *d_num_attempted_;
   int *d_num_accepted_;
 
@@ -96,8 +98,6 @@ protected:
   RealType *d_x_proposed_;
   RealType *d_box_proposed_;
 
-  int *d_system_idxs_;
-
   int *d_atom_idxs_;   // grouped index to atom coords
   int *d_mol_idxs_;    // grouped index to molecule index
   int *d_mol_offsets_; // Offset of molecules to determine size of mols
@@ -106,8 +106,6 @@ protected:
                                     // ensure deterministic behavior
 
   StreamedPotentialRunner<RealType> runner_;
-
-  EnergyAccumulator nrg_accum_;
 };
 
 } // namespace tmd

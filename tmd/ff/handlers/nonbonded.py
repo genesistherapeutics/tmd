@@ -1,5 +1,4 @@
 # Copyright 2019-2025, Relay Therapeutics
-# Modifications Copyright 2025-2026, Forrest York
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,7 +34,8 @@ from rdkit import Chem
 from tmd import constants
 from tmd.fe.utils import generate_conformations, get_mol_name
 from tmd.ff.handlers import openmm_deserializer
-from tmd.ff.handlers.bcc_aromaticity import AromaticityModel, oe_match_smirks
+from tmd.ff.handlers.bcc_aromaticity import AromaticityModel
+from tmd.ff.handlers.bcc_aromaticity import match_smirks as oe_match_smirks
 from tmd.ff.handlers.elf import prune_conformers_elf
 from tmd.ff.handlers.serialize import SerializableMixIn
 from tmd.ff.handlers.utils import (
@@ -53,9 +53,7 @@ AM1_CHARGE_CACHE = "AM1Cache"
 AM1BCC_CHARGE_CACHE = "AM1BCCCache"
 AM1ELF10_CHARGE_CACHE = "AM1ELF10Cache"
 AM1BCCELF10_CHARGE_CACHE = "AM1BCCELF10Cache"
-BOND_SMIRK_MATCH_CACHE = "BondSmirkMatchCache"  # Implicitly the OE bond smirk match cache
-AMBER_AM1BCCELF10_CHARGE_CHACHE = f"AmberAM1BCC{CACHE_SUFFIX}"
-RDKIT_BOND_SMIRK_MATCH_CACHE = f"RDKit{BOND_SMIRK_MATCH_CACHE}"
+BOND_SMIRK_MATCH_CACHE = "BondSmirkMatchCache"
 NN_FEATURES_PROPNAME = "NNFeatures"
 
 AM1 = "AM1"
@@ -288,13 +286,14 @@ def compute_or_load_oe_charges(mol, mode=AM1ELF10):
 
 
 def compute_or_load_amber_am1bcc_charges(mol):
-    if not mol.HasProp(AMBER_AM1BCCELF10_CHARGE_CHACHE):
+    cache_prop_name = f"AmberAM1BCC{CACHE_SUFFIX}"
+    if not mol.HasProp(cache_prop_name):
         am1_charges = list(amber_am1bcc_assign_charges(mol))
 
-        mol.SetProp(AMBER_AM1BCCELF10_CHARGE_CHACHE, base64.b64encode(pickle.dumps(am1_charges)))
+        mol.SetProp(cache_prop_name, base64.b64encode(pickle.dumps(am1_charges)))
 
     else:
-        am1_charges = pickle.loads(base64.b64decode(mol.GetProp(AMBER_AM1BCCELF10_CHARGE_CHACHE)))
+        am1_charges = pickle.loads(base64.b64decode(mol.GetProp(cache_prop_name)))
         assert len(am1_charges) == mol.GetNumAtoms(), "Charge cache has different number of charges than mol atoms"
 
     return np.array(am1_charges)
@@ -411,7 +410,7 @@ def amber_am1bcc_charge_mol(mol: Chem.Mol) -> NDArray:
     return charges
 
 
-def compute_or_load_oe_bond_smirks_matches(mol: Chem.Mol, smirks_list: list[str]) -> tuple[NDArray, NDArray]:
+def compute_or_load_bond_smirks_matches(mol, smirks_list):
     """Unless already cached in mol's "BondSmirkMatchCache" property, uses OpenEye to compute arrays of ordered bonds and their assigned types.
 
     Notes
@@ -445,39 +444,6 @@ def compute_or_load_oe_bond_smirks_matches(mol: Chem.Mol, smirks_list: list[str]
         mol.SetProp(BOND_SMIRK_MATCH_CACHE, base64.b64encode(pickle.dumps((bond_idxs, type_idxs))))
     else:
         bond_idxs, type_idxs = pickle.loads(base64.b64decode(mol.GetProp(BOND_SMIRK_MATCH_CACHE)))
-    return np.array(bond_idxs), np.array(type_idxs)
-
-
-def compute_or_load_rdkit_bond_smirks_matches(mol: Chem.Mol, smirks_list: list[str]) -> tuple[NDArray, NDArray]:
-    """Unless already cached in mol's "RDKitBondSmirkMatchCache" property, uses RDKit to compute arrays of ordered bonds and their assigned types.
-
-    Notes
-    -----
-    * Order within smirks_list matters
-        "First match wins."
-        For example, if bond (a,b) can be matched by smirks_list[2], smirks_list[5], ..., assign type 2
-    * Order within each smirks pattern matters
-        For example, "[#6:1]~[#1:2]" and "[#1:1]~[#6:2]" will match atom pairs in the opposite order
-    """
-    if not mol.HasProp(RDKIT_BOND_SMIRK_MATCH_CACHE):
-        bond_idxs = []  # [B, 2]
-        type_idxs = []  # [B]
-
-        for type_idx, smirks in enumerate(smirks_list):
-            matches = rd_match_smirks(mol, smirks)
-
-            for matched_indices in matches:
-                a, b = matched_indices[0], matched_indices[1]
-                forward_matched_bond = [a, b]
-
-                already_assigned = forward_matched_bond in bond_idxs
-
-                if not already_assigned:
-                    bond_idxs.append(forward_matched_bond)
-                    type_idxs.append(type_idx)
-        mol.SetProp(RDKIT_BOND_SMIRK_MATCH_CACHE, base64.b64encode(pickle.dumps((bond_idxs, type_idxs))))
-    else:
-        bond_idxs, type_idxs = pickle.loads(base64.b64decode(mol.GetProp(RDKIT_BOND_SMIRK_MATCH_CACHE)))
     return np.array(bond_idxs), np.array(type_idxs)
 
 
@@ -671,13 +637,13 @@ class AM1Handler(SerializableMixIn):
         assert props is None
 
     def partial_parameterize(self, _, mol):
-        return self.parameterize(mol)
+        return self.static_parameterize(mol)
 
     def parameterize(self, mol):
-        return self.static_parameterize(None, None, mol)
+        return self.static_parameterize(mol)
 
     @staticmethod
-    def static_parameterize(params, smirks, mol):
+    def static_parameterize(mol):
         """
         Parameters
         ----------
@@ -781,13 +747,13 @@ class AM1BCCHandler(SerializableMixIn):
         self.props = None
 
     def partial_parameterize(self, _, mol):
-        return self.parameterize(mol)
+        return self.static_parameterize(mol)
 
     def parameterize(self, mol):
-        return self.static_parameterize(self.params, self.smirks, mol)
+        return self.static_parameterize(mol)
 
     @staticmethod
-    def static_parameterize(params, smirks, mol):
+    def static_parameterize(mol):
         """
         Parameters
         ----------
@@ -827,13 +793,13 @@ class AmberAM1BCCHandler(SerializableMixIn):
         self.props = None
 
     def partial_parameterize(self, _, mol):
-        return self.parameterize(mol)
+        return self.static_parameterize(mol)
 
     def parameterize(self, mol):
-        return self.static_parameterize(self.params, self.smirks, mol)
+        return self.static_parameterize(mol)
 
     @staticmethod
-    def static_parameterize(params, smirks, mol):
+    def static_parameterize(mol):
         """
         Parameters
         ----------
@@ -850,71 +816,6 @@ class AmberAM1BCCIntraHandler(AmberAM1BCCHandler):
 
 
 class AmberAM1BCCSolventHandler(AmberAM1BCCHandler):
-    pass
-
-
-class AmberAM1CCCHandler(SerializableMixIn):
-    """The AmberAM1CCCHandler generates charges for molecules using AmberTools's Antechamber AM1BCC protocol followed by
-    applying Correctable Charge Corrections (CCCs)
-
-    This will generate conformers and run a version of ELF10 based on OpenFF implementation.
-
-    References
-    ----------
-    [1] AM1BCCELF10 Theory
-        https://docs.eyesopen.com/toolkits/python/quacpactk/molchargetheory.html#elf-conformer-selection
-    """
-
-    def __init__(self, smirks, params, props):
-        assert len(smirks) == len(params)
-        assert props is None
-        self.smirks = smirks
-        self.params = np.asarray(params, dtype=np.float64)
-        self.props = None
-
-    def partial_parameterize(self, params, mol):
-        return self.static_parameterize(params, self.smirks, mol)
-
-    def parameterize(self, mol):
-        return self.static_parameterize(self.params, self.smirks, mol)
-
-    @staticmethod
-    def static_parameterize(params, smirks, mol):
-        """
-        Parameters
-        ----------
-
-        params: NDArray
-            Parameters associated with each smirks pattern
-
-        smirks: list[str]
-            List of smirks to match
-
-        mol: Chem.Mol
-            molecule to be parameterized.
-
-        """
-        am1bcc_charges = compute_or_load_amber_am1bcc_charges(mol)
-        bond_idxs, type_idxs = compute_or_load_rdkit_bond_smirks_matches(mol, smirks)
-
-        deltas = params[type_idxs]
-        q_params = apply_bond_charge_corrections(
-            am1bcc_charges,
-            bond_idxs,
-            deltas,
-            runtime_validate=False,  # required for jit
-        )
-
-        assert q_params.shape[0] == mol.GetNumAtoms()  # check that return shape is consistent with input mol
-
-        return q_params
-
-
-class AmberAM1CCCIntraHandler(AmberAM1CCCHandler):
-    pass
-
-
-class AmberAM1CCCSolventHandler(AmberAM1CCCHandler):
     pass
 
 
@@ -999,7 +900,7 @@ class EnvironmentBCCHandler(SerializableMixIn):
         return jnp.array([q_params[i] for i in range(n_atoms)])
 
     def _compute_res_charges(self, res_name, topology_res_mol, initial_res_charges, params):
-        bond_idxs, type_idxs = compute_or_load_oe_bond_smirks_matches(topology_res_mol, self.patterns)
+        bond_idxs, type_idxs = compute_or_load_bond_smirks_matches(topology_res_mol, self.patterns)
         deltas = params[type_idxs]
         return apply_bond_charge_corrections(
             initial_res_charges,
@@ -1246,7 +1147,7 @@ class AM1CCCHandler(SerializableMixIn):
         # (ytz): leave this comment here, useful for quickly disable AM1 calculations for large mols
         # return np.zeros(mol.GetNumAtoms())
         am1_charges = compute_or_load_oe_charges(mol, mode=mode)
-        bond_idxs, type_idxs = compute_or_load_oe_bond_smirks_matches(mol, smirks)
+        bond_idxs, type_idxs = compute_or_load_bond_smirks_matches(mol, smirks)
 
         deltas = params[type_idxs]
         q_params = apply_bond_charge_corrections(

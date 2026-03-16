@@ -16,8 +16,6 @@
 
 namespace tmd {
 
-int __forceinline__ __host__ __device__ ceil_divide(int x, int y) {
-  return (x + y - 1) / y;
-};
+int __forceinline__ ceil_divide(int x, int y) { return (x + y - 1) / y; };
 
 } // namespace tmd

@@ -1,5 +1,5 @@
 # Copyright 2019-2025, Relay Therapeutics
-# Modifications Copyright 2025-2026 Forrest York
+# Modifications Copyright 2025 Forrest York
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -90,23 +90,23 @@ if install_custom_ops():
 
 setup(
     name="tmd",
-    version="0.3.0",
+    version="0.2.0",
     cmdclass={"build_ext": CMakeBuild},
     description="A high-performance differentiable molecular dynamics and optimization engine",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/badisa/tmd",
     author="Forrest York",
-    license="Apache-2.0",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
+        "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
         "Environment :: GPU :: NVIDIA CUDA :: 12",
     ],
     keywords="molecular dynamics",
     ext_modules=ext_modules,
     packages=find_packages(),
-    python_requires=">=3.12",
+    python_requires=">=3.10",
     install_requires=[
         "jax[cuda12]",
         "networkx",
@@ -133,12 +133,6 @@ setup(
         "tmd": [
             "py.typed",
         ],
-        "tmd.lib": [
-            "*.so*",
-        ],
-        "tmd.ff.params": [
-            "*.xml",
-        ],
         "tmd.testsystems": [
             "**/*.pdb",
             "**/*.npz",
@@ -155,7 +149,7 @@ setup(
         ],
     },
     project_urls={
-        "Bug Reports": "https://github.com/tmd-industries/tmd/issues",
-        "Source": "https://github.com/tmd-industries/tmd",
+        "Bug Reports": "https://github.com/badisa/tmd/issues",
+        "Source": "https://github.com/badisa/tmd/",
     },
 )
