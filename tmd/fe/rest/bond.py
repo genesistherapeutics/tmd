@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod, abstractproperty
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, TypeAlias, TypeVar
+from typing import Callable, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -113,7 +113,7 @@ class CanonicalProper(CanonicalIxn):
         return CanonicalProper.from_idxs(f(self.i), f(self.j), f(self.k), f(self.l))
 
 
-Idx: TypeAlias = int | np.integer
+type Idx = int | np.integer
 
 
 def mkbond(i: Idx, j: Idx) -> CanonicalBond:

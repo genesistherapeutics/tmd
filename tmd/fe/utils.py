@@ -16,7 +16,7 @@
 import hashlib
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, TypeAlias
+from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -325,7 +325,7 @@ def plot_atom_mapping_grid(
     )
 
 
-_Core: TypeAlias = Sequence[Sequence[int]] | NDArray
+type _Core = Sequence[Sequence[int]] | NDArray
 
 
 def view_atom_mapping_3d(
