@@ -154,8 +154,6 @@ def run_rbfe_leg(
     min_overlap: float,
     write_trajectories: bool,
     force_overwrite: bool,
-    summary_log: bool = False,
-    checkpoint_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run an RBFE leg (vacuum, solvent, or complex).
 
@@ -235,14 +233,6 @@ def run_rbfe_leg(
     np.random.seed(md_params.seed)
     start = time.perf_counter()
     host_config = None
-
-    leg_ckpt_dir = None
-    if checkpoint_dir is not None:
-        leg_ckpt_dir = Path(file_client.full_path(Path(edge_path) / leg_name))
-        leg_ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    extra_kwargs: dict[str, Any] = dict(summary_log=summary_log, checkpoint_dir=leg_ckpt_dir)
-
     if leg_name == VACUUM_LEG:
         res = run_vacuum(
             mol_a,
@@ -253,7 +243,6 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
-            **extra_kwargs,
         )
     elif leg_name == SOLVENT_LEG:
         res, host_config = run_solvent(
@@ -265,7 +254,6 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
-            **extra_kwargs,
         )
     elif leg_name == COMPLEX_LEG:
         assert pdb_path is not None, "No pdb data provided"
@@ -278,7 +266,6 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
-            **extra_kwargs,
         )
     else:
         assert 0, f"Invalid leg: {leg_name}"
@@ -360,4 +347,14 @@ def run_rbfe_leg(
     )
     # Contains initial states and the complete u_kln
     file_client.store(leg_path / "final_pairbar_result.pkl", pickle.dumps(res.final_result))
+
+    log_path = Path(file_client.full_path(leg_path / "timing.log"))
+    with open(log_path, "w") as f:
+        f.write(f"edge: {get_mol_name(mol_a)} -> {get_mol_name(mol_b)}\n")
+        f.write(f"leg: {leg_name}\n")
+        f.write(f"total_time: {took:.2f}s\n")
+        f.write(f"pred_dg (kJ/mol): {pred_dg:.2f} +/- {pred_dg_err:.2f}\n")
+        f.write(f"n_windows: {len(res.final_result.initial_states)}\n")
+        f.write(f"min_overlap: {min(res.final_result.overlaps):.3f}\n")
+
     return summary_data
