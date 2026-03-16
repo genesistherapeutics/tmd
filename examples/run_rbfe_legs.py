@@ -185,18 +185,8 @@ def main():
         )
         futures.append(fut)
     leg_results = defaultdict(dict)
-    failed = False
     for leg, fut in zip(args.legs, futures):
-        if failed:
-            fut.cancel()
-            print(f"Skipping leg {leg}: sibling leg already failed")
-            continue
-        try:
-            res = fut.result()
-        except Exception as e:
-            print(f"Leg {leg} ({args.mol_a} -> {args.mol_b}) failed: {e}")
-            failed = True
-            continue
+        res = fut.result()
         leg_results[(get_mol_name(mol_a), get_mol_name(mol_b))][leg] = res
     write_result_csvs(file_client, mols_by_name, leg_results, args.experimental_field, args.experimental_units)
 
