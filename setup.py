@@ -69,6 +69,24 @@ class CMakeBuild(build_ext):
         if "CMAKE_ARGS" in os.environ:
             cmake_args += [item for item in os.environ["CMAKE_ARGS"].split(" ") if item]
 
+        # Auto-detect conda CUDA toolkit. conda puts nvcc in $CONDA_PREFIX/bin but
+        # headers in $CONDA_PREFIX/targets/x86_64-linux/include/ — not the standard
+        # path cmake expects when deriving the toolkit root from the compiler path.
+        # Without this, builds fail on machines without a system CUDA at /usr/local/cuda.
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if conda_prefix and os.path.isfile(os.path.join(conda_prefix, "bin", "nvcc")):
+            existing = " ".join(cmake_args)
+            if "CUDAToolkit_ROOT" not in existing:
+                cmake_args += [
+                    f"-DCUDAToolkit_ROOT={conda_prefix}",
+                    f"-DCMAKE_CUDA_COMPILER={conda_prefix}/bin/nvcc",
+                ]
+            cuda_targets_include = os.path.join(conda_prefix, "targets", "x86_64-linux", "include")
+            if os.path.isdir(cuda_targets_include):
+                cpath = os.environ.get("CPATH", "")
+                if cuda_targets_include not in cpath:
+                    os.environ["CPATH"] = f"{cuda_targets_include}:{cpath}" if cpath else cuda_targets_include
+
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
             build_args += [f"-j{multiprocessing.cpu_count()}"]
 
