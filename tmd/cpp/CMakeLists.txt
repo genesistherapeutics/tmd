@@ -35,7 +35,12 @@ else()
 endif()
 
 
-string(APPEND CMAKE_CXX_FLAGS "${COMMON_COMPILER_FLAGS} -Werror -Wdouble-promotion -Wno-error=double-promotion -Wno-error=template-id-cdtor")
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-Wtemplate-id-cdtor" COMPILER_HAS_WTEMPLATE_ID_CDTOR)
+if(COMPILER_HAS_WTEMPLATE_ID_CDTOR)
+  set(WNO_TEMPLATE_ID_CDTOR "-Wno-error=template-id-cdtor")
+endif()
+string(APPEND CMAKE_CXX_FLAGS "${COMMON_COMPILER_FLAGS} -Werror -Wdouble-promotion -Wno-error=double-promotion ${WNO_TEMPLATE_ID_CDTOR}")
 string(APPEND CMAKE_CUDA_FLAGS ${COMMON_COMPILER_FLAGS})
 
 string(APPEND CMAKE_CUDA_FLAGS
