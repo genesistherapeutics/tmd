@@ -108,7 +108,7 @@ if install_custom_ops():
 
 setup(
     name="tmd",
-    version="0.3.1",
+    version="0.3.2",
     cmdclass={"build_ext": CMakeBuild},
     description="A high-performance differentiable molecular dynamics and optimization engine",
     long_description=long_description,
@@ -147,6 +147,7 @@ setup(
             "py3Dmol==2.0.3",
         ],
         "viz": ["py3Dmol"],
+        "mdtraj": ["mdtraj"],
     },
     package_data={
         "tmd": [
