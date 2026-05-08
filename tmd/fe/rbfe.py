@@ -277,7 +277,7 @@ def setup_initial_state(
             st, host, ligand_conf, lamb, temperature, init_seed, verify_constraints=verify_constraints
         )
         box0 = host.box
-        protein_idxs = np.arange(0, len(host.masses) - host.num_water_atoms)
+        protein_idxs = np.arange(0, len(host.masses) - host.num_water_atoms, dtype=np.int32)
     else:
         x0, box0, hmr_masses, potentials, baro = setup_in_vacuum(
             st, ligand_conf, lamb, verify_constraints=verify_constraints
@@ -998,7 +998,10 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         mean_final_barostat_volume_scale_factor = get_mean_final_barostat_volume_scale_factor(trajectories_by_state)
         assert (mean_final_barostat_volume_scale_factor is not None) == all(has_barostat_by_state)
 
+        summed_pot = None
+
         def get_initial_state(lamb: float) -> InitialState:
+            nonlocal summed_pot
             state_idx = get_nearest_state_idx(lamb, initial_states)
             nearest_state = initial_states[state_idx]
             traj = trajectories_by_state[state_idx]
@@ -1008,9 +1011,19 @@ def estimate_relative_free_energy_bisection_hrex_impl(
                 # If the lambda value is different, reconstruct the initial state to the correct parameters
                 state = make_initial_state_fn(lamb)
 
+                # Setup a single summed pot for checking forces
+                if summed_pot is None:
+                    summed_pot = state.to_bound_impl().get_potential()
+
                 # Verify that the forces of the nearest lambda value's frames are stable, since frames were not generated
                 # with the same parameters
-                du_dx, _ = state.to_bound_impl().execute(traj.frames[-1], traj.boxes[-1], compute_u=False)
+                du_dx, _, _ = summed_pot.execute(
+                    traj.frames[-1],
+                    np.concatenate([np.asarray(bp.params).reshape(-1) for bp in state.potentials]),
+                    traj.boxes[-1],
+                    compute_u=False,
+                    compute_du_dp=False,
+                )
                 minimizer.check_force_norm(-du_dx)
             # Use equilibrated samples and the average of the final barostat volume scale factors from bisection phase to
             # initialize states for HREX
@@ -1044,6 +1057,9 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         else:
             initial_states_hrex = [get_initial_state(s.lamb) for s in initial_states]
         print(f"[TIMER] lambda_rebalance {time.perf_counter() - t0:.2f}s", flush=True)
+
+        # Delete the summed potential to reduce GPU memory usage
+        del summed_pot
 
         # Second phase: sample initial states determined by bisection using HREX
         t0 = time.perf_counter()
@@ -1262,11 +1278,11 @@ def run_solvent(
     n_windows: Optional[int] = None,
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = None,
+    box_width: float = 4.0,
 ):
     if md_params is not None and md_params.water_sampling_params is not None:
         md_params = replace(md_params, water_sampling_params=None)
         warnings.warn("Solvent simulations don't benefit from water sampling, disabling")
-    box_width = 4.0
     solvent_host_config = builders.build_water_system(
         box_width, forcefield.water_ff, mols=[mol_a, mol_b], box_margin=0.1
     )
