@@ -23,9 +23,10 @@ from warnings import warn
 import jax
 import numpy as np
 from numpy.typing import NDArray
+from rdkit import Chem
 
 from tmd._vendored.pymbar.utils import kln_to_kn
-from tmd.constants import BOLTZ
+from tmd.constants import BOLTZ, NBParamIdx
 from tmd.fe import model_utils, topology
 from tmd.fe.bar import (
     bar_with_pessimistic_uncertainty,
@@ -35,7 +36,8 @@ from tmd.fe.bar import (
     sanitize_energies_for_bar,
     works_from_ukln,
 )
-from tmd.fe.lambda_schedule import interpolate_pre_optimized_protocol
+from tmd.fe.interpolate import linear_interpolation, pad
+from tmd.fe.lambda_schedule import construct_pre_optimized_relative_lambda_schedule, interpolate_pre_optimized_protocol
 from tmd.fe.plots import (
     plot_as_png_fxn,
     plot_dG_errs_figure,
@@ -105,9 +107,6 @@ class HREXParams:
     n_frames_bisection: int
         Number of frames to sample using MD during the initial bisection phase used to determine lambda spacing
 
-    n_frames_per_iter: int
-        DEPRECATED, must be set to 1. Number of frames to sample using MD per HREX iteration.
-
     max_delta_states: int or None
         If given, number of neighbor states on either side of a given replica's initial state for which to compute
         potentials. This determines the maximum number of states that a replica can move from its initial state during
@@ -116,6 +115,9 @@ class HREXParams:
     optimize_target_overlap: float or None
         If given, optimize the lambda schedule out of the initial bisection phase to target a specific minimum overlap
         between all adjacent windows. Must be in the interval (0.0, 1.0) if provided.
+
+    rest_params: RESTParams or None
+       Parameters that control REST. Only compatible with SingleTopologyREST, will be ignored otherwise.
     """
 
     n_frames_bisection: int = 100
@@ -535,8 +537,15 @@ class BaseFreeEnergy:
 
 
 # this class is serializable.
+# DEBOGGLE: Move this to tmd.fe.absolute.free_energy
 class AbsoluteFreeEnergy(BaseFreeEnergy):
-    def __init__(self, mol, top):
+    def __init__(
+        self,
+        mol: Chem.Mol,
+        top,
+        decharge_interval: tuple[float, float] = (0.0, 0.2),
+        eps_scale_interval: tuple[float, float] = (0.2, 0.4),
+    ):
         """
         Compute the absolute free energy of a molecule via 4D decoupling.
 
@@ -548,9 +557,26 @@ class AbsoluteFreeEnergy(BaseFreeEnergy):
         top: Topology
             topology.Topology to use
 
+        decharge_interval: tuple[float, float]
+            Interval over which the ligand intermolecular charge is decharged over. Only intended for testing, suggested not to edge.
+        eps_scale_interval: tuple[float, float]
+            Interval over which the ligand intermolecular epsilon is scaled down over. Only intended for testing, suggested not to edge.
+
         """
         self.mol = mol
         self.top = top
+
+        def verify_interval(interval):
+            assert len(interval) == 2
+            assert interval[0] < interval[1]
+            assert interval[0] >= 0.0
+            assert interval[1] <= 1.0
+
+        verify_interval(decharge_interval)
+        verify_interval(eps_scale_interval)
+
+        self.decharge_interval = decharge_interval
+        self.eps_scale_interval = eps_scale_interval
 
     def prepare_host_edge(
         self, ff: Forcefield, host_config: HostConfig, lamb: float
@@ -567,7 +593,7 @@ class AbsoluteFreeEnergy(BaseFreeEnergy):
             HostConfig containing openmm System object to be deserialized.
 
         lamb: float
-            alchemical parameter controlling 4D decoupling
+            alchemical parameter controlling 4D decoupling and the ligand intermolecular charge
 
         Returns
         -------
@@ -582,8 +608,44 @@ class AbsoluteFreeEnergy(BaseFreeEnergy):
         )
 
         combined_params, combined_potentials = self._get_system_params_and_potentials(ff_params, hgt, lamb)
+        combined_params = list(combined_params)
+        if lamb > 0.0:
+            # Linearly decharge the ligand
+            nb_params_idx = next(i for i, pot in enumerate(combined_potentials) if isinstance(pot, Nonbonded))
+            nb_params = combined_params[nb_params_idx]
+            nb_params = nb_params.at[len(host_config.conf) :, NBParamIdx.Q_IDX].set(
+                pad(
+                    linear_interpolation,
+                    nb_params[len(host_config.conf) :, NBParamIdx.Q_IDX],
+                    np.zeros_like(nb_params[len(host_config.conf) :, NBParamIdx.Q_IDX]),
+                    lamb,
+                    self.decharge_interval[0],
+                    self.decharge_interval[1],
+                )
+            )
+            # Scale down the epsilon term
+            dst_eps = nb_params[len(host_config.conf) :, NBParamIdx.LJ_EPS_IDX] / 3
+            nb_params = nb_params.at[len(host_config.conf) :, NBParamIdx.LJ_EPS_IDX].set(
+                pad(
+                    linear_interpolation,
+                    nb_params[len(host_config.conf) :, NBParamIdx.LJ_EPS_IDX],
+                    np.where(dst_eps > 0.02, dst_eps, 0.02),
+                    lamb,
+                    self.eps_scale_interval[0],
+                    self.eps_scale_interval[1],
+                )
+            )
+
+            # Shift the W coordinate to improve efficiency
+            lambdas = construct_pre_optimized_relative_lambda_schedule(None)
+            x = np.linspace(0.0, 1.0, len(lambdas))
+            nb_params = nb_params.at[len(host_config.conf) :, NBParamIdx.W_IDX].set(
+                linear_interpolation(0.0, hgt.host_nonbonded.potential.cutoff, np.interp(lamb, x, lambdas))
+            )
+            combined_params[nb_params_idx] = nb_params  # type: ignore
+
         combined_masses = self._combine(ligand_masses, np.array(host_config.masses))
-        return combined_potentials, combined_params, combined_masses
+        return combined_potentials, tuple(combined_params), combined_masses
 
     def prepare_vacuum_edge(self, ff: Forcefield) -> tuple[tuple[Potential, ...], tuple, NDArray]:
         """

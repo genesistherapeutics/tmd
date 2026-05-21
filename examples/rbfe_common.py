@@ -158,6 +158,7 @@ def run_rbfe_leg(
     write_trajectories: bool,
     force_overwrite: bool,
     water_box_size: float = 4.0,
+    add_membrane: bool = False,
 ) -> dict[str, Any]:
     """Run an RBFE leg (vacuum, solvent, or complex).
 
@@ -208,6 +209,8 @@ def run_rbfe_leg(
         The size of the water box. Should be large enough to avoid molecules interacting with
         copies of themselves across PBCs. Use `tmd.md.builders.compute_solvent_box_size` to
         setup appropriate sizes.
+    add_membrane: bool
+        Add a POPC membrane to the protein system
 
     Returns
     -------
@@ -300,6 +303,7 @@ def run_rbfe_leg(
             md_params,
             n_windows=n_windows,
             min_overlap=min_overlap,
+            add_membrane=add_membrane,
         )
     else:
         assert 0, f"Invalid leg: {leg_name}"
