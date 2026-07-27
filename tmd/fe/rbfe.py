@@ -56,7 +56,7 @@ from tmd.fe.rest.utils import assign_rest_atoms_from_smarts
 from tmd.fe.single_topology import AtomMapFlags, SingleTopology, assert_default_system_constraints
 from tmd.fe.utils import bytes_to_id, get_mol_name, get_romol_conf
 from tmd.ff import Forcefield
-from tmd.lib import LangevinIntegrator, MonteCarloBarostat
+from tmd.lib import ConstrainedLangevinIntegrator, LangevinIntegrator, MonteCarloBarostat
 from tmd.md import builders, minimizer
 from tmd.md.barostat.utils import get_bond_list, get_group_indices
 from tmd.md.builders import HostConfig
@@ -99,7 +99,7 @@ def _get_default_state_minimization_configs() -> Sequence[minimizer.Minimization
 
 
 def setup_optimized_host(
-    config: HostConfig, mols: list[Chem.Mol], forcefield: Forcefield, equilibration_steps: int = 1000, seed: int = 2024
+    config: HostConfig, mols: list[Chem.Mol], forcefield: Forcefield, equilibration_steps: int = 10000, seed: int = 2024
 ) -> HostConfig:
     """
     Optimize a host config host using pre_equilibrate_host
@@ -261,6 +261,7 @@ def setup_initial_state(
     temperature: float,
     seed: int,
     verify_constraints: bool,
+    dt: float = 2.5e-3,
 ) -> InitialState:
     conf_a = get_romol_conf(st.mol_a)
     conf_b = get_romol_conf(st.mol_b)
@@ -297,10 +298,18 @@ def setup_initial_state(
     num_total_atoms = len(x0)
     ligand_idxs = np.arange(num_total_atoms - num_ligand_atoms, num_total_atoms, dtype=np.int32)
 
-    # initialize Langevin integrator
-    dt = 2.5e-3
+    # initialize integrator
     friction = 1.0
-    intg = LangevinIntegrator(temperature, dt, friction, hmr_masses, run_seed)
+    intg: ConstrainedLangevinIntegrator | LangevinIntegrator
+    if dt > 2.5e-3:
+        if host is not None:
+            constraints = st.combine_constraints(host)
+        else:
+            constraints = st.get_constraint_groups()
+        intg = ConstrainedLangevinIntegrator(temperature, dt, friction, hmr_masses, run_seed, constraints)
+        # Prune bond constraints
+    else:
+        intg = LangevinIntegrator(temperature, dt, friction, hmr_masses, run_seed)
 
     # Determine the atoms that are in the 4d plane defined by all w_coords being 0.0
     # TBD: Do something more sophisticated depending on the actual parameters for when we vary w_coords independently.
@@ -325,6 +334,7 @@ def setup_initial_states(
     seed: int,
     verify_constraints: bool,
     min_cutoff: Optional[float] = None,
+    dt: float = 2.5e-3,
 ) -> list[InitialState]:
     """
     Given a sequence of lambda values, return a list of initial states.
@@ -358,6 +368,10 @@ def setup_initial_states(
         Throw error if any atom moves more than this distance (nm) after minimization. Typically only meaningful
         in the complex leg where the check may indicate that the ligand is no longer posed reliably.
 
+    dt: float
+        The timestep to run (nanoseconds). Defaults to 2.5fs. If the dt is greater than 1.5 HMR will be applied, if higher than
+        2.5fs then constraints are applied.
+
     Returns
     -------
     list of InitialState
@@ -368,7 +382,7 @@ def setup_initial_states(
     assert np.all(np.diff(lambda_schedule) > 0)
 
     initial_states = [
-        setup_initial_state(st, lamb, host, temperature, seed, verify_constraints) for lamb in lambda_schedule
+        setup_initial_state(st, lamb, host, temperature, seed, verify_constraints, dt=dt) for lamb in lambda_schedule
     ]
 
     # minimize ligand and environment atoms within min_cutoff of the ligand
@@ -717,7 +731,14 @@ def estimate_relative_free_energy(
     lambda_schedule = np.linspace(lambda_min, lambda_max, n_windows or DEFAULT_NUM_WINDOWS)
 
     initial_states = setup_initial_states(
-        single_topology, host_config, temperature, lambda_schedule, md_params.seed, False, min_cutoff=min_cutoff
+        single_topology,
+        host_config,
+        temperature,
+        lambda_schedule,
+        md_params.seed,
+        False,
+        min_cutoff=min_cutoff,
+        dt=md_params.dt,
     )
 
     # TODO: rename prefix to postfix, or move to beginning of combined_prefix?
@@ -830,7 +851,14 @@ def estimate_relative_free_energy_bisection(
 
     t0 = time.perf_counter()
     initial_states = setup_initial_states(
-        single_topology, host_config, temperature, lambda_grid, md_params.seed, False, min_cutoff=min_cutoff
+        single_topology,
+        host_config,
+        temperature,
+        lambda_grid,
+        md_params.seed,
+        False,
+        min_cutoff=min_cutoff,
+        dt=md_params.dt,
     )
     print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
 
@@ -840,6 +868,7 @@ def estimate_relative_free_energy_bisection(
         host=host_config,
         temperature=temperature,
         seed=md_params.seed,
+        dt=md_params.dt,
         verify_constraints=False,  # Speeds up construction of initial state
     )
 
@@ -1094,6 +1123,7 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             hrex_diagnostics,
             hrex_plots,
             water_sampling_diagnostics=ws_diagnostics,
+            iterations_per_frame=md_params.hrex_params.iterations_per_frame,
         )
 
     except Exception as err:
@@ -1202,7 +1232,14 @@ def estimate_relative_free_energy_bisection_hrex(
 
     t0 = time.perf_counter()
     initial_states = setup_initial_states(
-        single_topology, host_config, temperature, lambda_grid, md_params.seed, False, min_cutoff=min_cutoff
+        single_topology,
+        host_config,
+        temperature,
+        lambda_grid,
+        md_params.seed,
+        False,
+        min_cutoff=min_cutoff,
+        dt=md_params.dt,
     )
     print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
 
@@ -1213,6 +1250,7 @@ def estimate_relative_free_energy_bisection_hrex(
         temperature=temperature,
         seed=md_params.seed,
         verify_constraints=False,  # Speeds up construction of initial state
+        dt=md_params.dt,
     )
 
     make_optimized_initial_state_fn = partial(

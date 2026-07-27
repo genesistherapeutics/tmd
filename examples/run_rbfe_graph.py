@@ -39,6 +39,12 @@ def main():
     parser.add_argument("--n_frames", default=2000, type=int, help="Number of frames to simulate")
     parser.add_argument("--steps_per_frame", default=400, type=int, help="Steps per frame")
     parser.add_argument(
+        "--hrex_iterations_per_frame",
+        default=1,
+        type=int,
+        help="Number of HREX iterations to run before collecting a frame. This will run steps_per_frame per each iteration, so it is suggested to reduce n_frames if increasing this value",
+    )
+    parser.add_argument(
         "--n_windows", default=DEFAULT_NUM_WINDOWS, type=int, help="Max number of windows from bisection"
     )
     parser.add_argument("--min_overlap", default=0.667, type=float, help="Overlap to target in bisection")
@@ -88,6 +94,12 @@ def main():
         help="Number of steps to run with Local MD. Must be less than or equal to --steps_per_frame. If set to 0, no local MD is run",
     )
     parser.add_argument(
+        "--local_md_iterations",
+        default=1,
+        type=int,
+        help="Number of independent local MD iterations to make. local_md_steps // local_md_iterations steps per iteration",
+    )
+    parser.add_argument(
         "--store_trajectories",
         action="store_true",
         help="Store the trajectories of the edges. Can take up a large amount of space",
@@ -114,10 +126,14 @@ def main():
         action="store_true",
         help="Add a POPC membrane to the protein. Refer to OpenMM for preparing proteins for adding Membranes",
     )
+    parser.add_argument("--dt_fs", default=2.5, type=float, help="Timestep in femptoseconds")
     args = parser.parse_args()
 
     if COMPLEX_LEG in args.legs:
         assert args.pdb_path is not None, "Must provide PDB to run complex leg"
+
+    assert args.dt_fs > 0.0
+    dt = args.dt_fs * 1e-3
 
     mols_by_name = read_sdf_mols_by_name(args.sdf_path)
     np.random.seed(args.seed)
@@ -178,6 +194,7 @@ def main():
             n_frames=args.n_frames,
             steps_per_frame=args.steps_per_frame,
             seed=args.seed,
+            dt=dt,
             hrex_params=HREXParams(
                 optimize_target_overlap=args.target_overlap,
                 rest_params=RESTParams(
@@ -185,6 +202,7 @@ def main():
                     args.rest_temperature_scale_interpolation,
                     args.rest_smarts_patterns,
                 ),
+                iterations_per_frame=args.hrex_iterations_per_frame,
             ),
             local_md_params=LocalMDParams(
                 args.local_md_steps,
@@ -192,6 +210,7 @@ def main():
                 min_radius=args.local_md_radius,
                 max_radius=args.local_md_radius,
                 freeze_reference=not args.local_md_free_reference,
+                iterations=args.local_md_iterations,
             )
             if args.local_md_steps > 0
             else None,
