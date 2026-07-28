@@ -1,4 +1,19 @@
-ne near-central atom is chosen
+# (C) 2026 Justin Gullingsrud
+
+"""Separated topologies (SepTop) relative binding free energy.
+
+Computes a relative binding free energy between two ligands ``mol_a`` and
+``mol_b`` via two legs that share a single alchemical schedule. Along one
+lambda coordinate, ``mol_a`` is decoupled as ``lambda`` goes 0 -> 1 while
+``mol_b`` is simultaneously coupled (it follows ``1 - lambda``).
+
+Both legs are driven by :func:`estimate_septop` via its ``phase`` argument:
+
+* ``phase="complex"`` -- the two ligands share a single solvated receptor and
+  each is held in place by Boresch-style restraints that turn on/off in
+  opposite directions along lambda.
+* ``phase="aqueous"`` -- the two ligands share a single water box (no
+  receptor). Instead of receptor restraints, one near-central atom is chosen
   in each ligand (see :func:`select_central_atoms`) and a single constant
   zero-length harmonic bond is applied between them. The symmetric bond
   cancels between endpoints, so the solvent leg needs no standard-state
@@ -41,22 +56,7 @@ from tmd.fe.absolute.abfe import (
 from tmd.fe.absolute.free_energy import RestraintParams
 from tmd.fe.absolute.restraints import (
     select_ligand_atoms_baumann,
-# (C) 2026 Justin Gullingsrud
-
-"""Separated topologies (SepTop) relative binding free energy.
-
-Computes a relative binding free energy between two ligands ``mol_a`` and
-``mol_b`` via two legs that share a single alchemical schedule. Along one
-lambda coordinate, ``mol_a`` is decoupled as ``lambda`` goes 0 -> 1 while
-``mol_b`` is simultaneously coupled (it follows ``1 - lambda``).
-
-Both legs are driven by :func:`estimate_septop` via its ``phase`` argument:
-
-* ``phase="complex"`` -- the two ligands share a single solvated receptor and
-  each is held in place by Boresch-style restraints that turn on/off in
-  opposite directions along lambda.
-* ``phase="aqueous"`` -- the two ligands share a single water box (no
-  receptor). Instead of receptor restraints, o    select_receptor_atoms_baumann,
+    select_receptor_atoms_baumann,
 )
 from tmd.fe.cif_writer import build_openmm_topology
 from tmd.fe.free_energy import (
