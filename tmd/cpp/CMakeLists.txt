@@ -40,8 +40,8 @@ check_cxx_compiler_flag("-Wtemplate-id-cdtor" COMPILER_HAS_WTEMPLATE_ID_CDTOR)
 if(COMPILER_HAS_WTEMPLATE_ID_CDTOR)
   set(WNO_TEMPLATE_ID_CDTOR "-Wno-error=template-id-cdtor")
 endif()
-string(APPEND CMAKE_CXX_FLAGS "${COMMON_COMPILER_FLAGS} -Werror -Wdouble-promotion -Wno-error=double-promotion ${WNO_TEMPLATE_ID_CDTOR}")
-string(APPEND CMAKE_CUDA_FLAGS ${COMMON_COMPILER_FLAGS})
+string(APPEND CMAKE_CXX_FLAGS " ${COMMON_COMPILER_FLAGS} -Werror -Wdouble-promotion -Wno-error=double-promotion ${WNO_TEMPLATE_ID_CDTOR}")
+string(APPEND CMAKE_CUDA_FLAGS " ${COMMON_COMPILER_FLAGS}")
 
 string(APPEND CMAKE_CUDA_FLAGS
   " -lineinfo"  # Disabling lineinfo reduces .so file by ~40MB
@@ -163,11 +163,11 @@ pybind11_add_module(${LIBRARY_NAME} MODULE NO_EXTRAS
 )
 
 include_directories(src/kernels)
-include_directories(SYSTEM ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+include_directories(SYSTEM ${CUDAToolkit_INCLUDE_DIRS})
 # To handle importing CCCL library headers in the host code (ie compiled by GCC), need to include CCCL directory
 # See https://nvidia.github.io/cccl/cccl/3.0_migration_guide.html#cuda-toolkit-changes
 if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
-  include_directories(SYSTEM ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/cccl/)
+  include_directories(SYSTEM ${CUDAToolkit_INCLUDE_DIRS}/cccl/)
 endif()
 include_directories(SYSTEM ${CMAKE_CURRENT_BINARY_DIR}/${EIGEN_SRC_DIR})
 
