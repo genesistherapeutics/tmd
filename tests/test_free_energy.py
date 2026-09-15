@@ -148,7 +148,31 @@ def test_hrex_checkpoint_state_validates_requested_simulation():
     checkpoint = make_hrex_checkpoint()
     md_params = MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2))
 
-    checkpoint.validate(n_states=3, n_potentials=2, md_params=md_params)
+    checkpoint.validate(n_states=3, n_potentials=2, n_atoms=4, md_params=md_params)
+
+
+@pytest.mark.parametrize(
+    ("replica_idx", "coords_shape", "velocities_shape"),
+    [
+        (0, (5, 3), (4, 3)),
+        (2, (4, 3), (5, 3)),
+    ],
+)
+def test_hrex_checkpoint_state_rejects_replica_atom_shape_mismatch(replica_idx, coords_shape, velocities_shape):
+    checkpoint = make_hrex_checkpoint()
+    replicas = list(checkpoint.hrex.replicas)
+    replicas[replica_idx] = CoordsVelBox(np.zeros(coords_shape), np.zeros(velocities_shape), np.eye(3))
+    checkpoint = replace(
+        checkpoint,
+        hrex=replace(
+            checkpoint.hrex,
+            replicas=replicas,
+        ),
+    )
+    md_params = MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2))
+
+    with pytest.raises(ValueError, match="coordinate and velocity shapes"):
+        checkpoint.validate(n_states=3, n_potentials=2, n_atoms=4, md_params=md_params)
 
 
 @pytest.mark.parametrize(
@@ -288,7 +312,7 @@ def test_hrex_checkpoint_state_validates_requested_simulation():
 )
 def test_hrex_checkpoint_state_rejects_malformed_state(checkpoint, n_states, n_potentials, md_params, message):
     with pytest.raises(ValueError, match=message):
-        checkpoint.validate(n_states=n_states, n_potentials=n_potentials, md_params=md_params)
+        checkpoint.validate(n_states=n_states, n_potentials=n_potentials, n_atoms=4, md_params=md_params)
 
 
 def assert_shapes_consistent(U, coords, sys_params, box):

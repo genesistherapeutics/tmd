@@ -223,7 +223,7 @@ class HREXCheckpoint:
     water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]]
     version: int = HREX_CHECKPOINT_VERSION
 
-    def validate(self, n_states: int, n_potentials: int, md_params: MDParams) -> None:
+    def validate(self, n_states: int, n_potentials: int, n_atoms: int, md_params: MDParams) -> None:
         if self.version != HREX_CHECKPOINT_VERSION:
             raise ValueError(f"Unsupported HREX checkpoint version: {self.version}")
         if md_params.hrex_params is None:
@@ -236,14 +236,15 @@ class HREXCheckpoint:
         if len(self.hrex.replicas) != n_states:
             raise ValueError(f"HREX checkpoint has {len(self.hrex.replicas)} replicas, expected {n_states}")
 
+        expected_atom_shape = (n_atoms, 3)
         for replica in self.hrex.replicas:
-            if (
-                np.ndim(replica.coords) != 2
-                or np.shape(replica.coords)[-1] != 3
-                or np.shape(replica.velocities) != np.shape(replica.coords)
-                or np.shape(replica.box) != (3, 3)
-            ):
-                raise ValueError("HREX checkpoint replica coordinates, velocities, or box have invalid dimensions")
+            if np.shape(replica.coords) != expected_atom_shape or np.shape(replica.velocities) != expected_atom_shape:
+                raise ValueError(
+                    "HREX checkpoint replica coordinate and velocity shapes have invalid dimensions; "
+                    f"expected {expected_atom_shape}"
+                )
+            if np.shape(replica.box) != (3, 3):
+                raise ValueError("HREX checkpoint replica box has invalid dimensions")
 
         expected_permutation = list(range(n_states))
         if sorted(self.hrex.replica_idx_by_state) != expected_permutation:
