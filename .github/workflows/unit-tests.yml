@@ -12,7 +12,7 @@ concurrency:
 jobs:
 
   lint:
-    runs-on: [self-hosted, gpu]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.12"]
