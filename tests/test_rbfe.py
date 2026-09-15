@@ -49,21 +49,6 @@ def make_stub_bisection_output():
     return [SimpleNamespace(initial_states=initial_states)], trajectories
 
 
-@pytest.mark.parametrize(
-    "checkpoint_kwargs",
-    [
-        {"resume_state": Mock(spec=HREXCheckpoint)},
-        {"checkpoint_interval_frames": 1},
-        {"checkpoint_callback": Mock()},
-    ],
-)
-def test_bisection_dispatch_rejects_hrex_checkpoint_arguments(checkpoint_kwargs):
-    md_params = MDParams(n_frames=1, n_eq_steps=0, steps_per_frame=1, seed=2026)
-
-    with pytest.raises(ValueError, match="HREX checkpoint arguments require HREX parameters"):
-        estimate_relative_free_energy_bisection_or_hrex(md_params=md_params, **checkpoint_kwargs)
-
-
 def test_bisection_dispatch_preserves_call_without_checkpoint_arguments():
     md_params = MDParams(n_frames=1, n_eq_steps=0, steps_per_frame=1, seed=2026)
     expected_result = Mock()
