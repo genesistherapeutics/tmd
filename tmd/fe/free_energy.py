@@ -2187,7 +2187,9 @@ def generate_pair_bar_ulkns(
     return u_kln_by_component_by_lambda
 
 
-def _compute_hrex_mover_steps(md_params: MDParams, current_iteration: int) -> tuple[int, int]:
+def _compute_hrex_mover_steps(
+    md_params: MDParams, current_iteration: int, include_equilibration_water_step: bool
+) -> tuple[int, int]:
     """Compute barostat and water-sampler phases for an HREX iteration."""
     local_steps = md_params.local_md_params.local_steps if md_params.local_md_params is not None else 0
     production_global_steps = md_params.steps_per_frame - local_steps
@@ -2198,7 +2200,9 @@ def _compute_hrex_mover_steps(md_params: MDParams, current_iteration: int) -> tu
         equilibration_batches = (md_params.n_eq_steps + md_params.steps_per_frame - 1) // md_params.steps_per_frame
         equilibration_global_steps = equilibration_batches * production_global_steps
 
-    water_sampler_step = barostat_step + (equilibration_global_steps if current_iteration > 0 else 0)
+    water_sampler_step = barostat_step
+    if include_equilibration_water_step and current_iteration > 0:
+        water_sampler_step += equilibration_global_steps
     return barostat_step, water_sampler_step
 
 
@@ -2225,7 +2229,9 @@ def run_sequential_hrex_step(
         water_sampler = next(mover for mover in context.get_movers() if isinstance(mover, WATER_SAMPLER_MOVERS))
 
     water_sampling_acceptance_proposal_counts_by_state = [(0, 0) for _ in range(len(hrex.replicas))]
-    barostat_step, water_sampler_step = _compute_hrex_mover_steps(md_params, current_frame)
+    barostat_step, water_sampler_step = _compute_hrex_mover_steps(
+        md_params, current_frame, include_equilibration_water_step=False
+    )
 
     def sample_replica(xvb: CoordsVelBox, state_idx: StateIdx) -> tuple[NDArray, NDArray, NDArray, Optional[float]]:
         context.set_x_t(xvb.coords)
@@ -2326,7 +2332,9 @@ def run_batched_hrex_step(
             bp.set_params(params)
 
     # Setup the MC movers of the Context
-    barostat_step, water_sampler_step = _compute_hrex_mover_steps(md_params, current_frame)
+    barostat_step, water_sampler_step = _compute_hrex_mover_steps(
+        md_params, current_frame, include_equilibration_water_step=True
+    )
 
     if water_sampler is not None:
         accepted = np.asarray(water_sampler.n_accepted())[state_to_replica]

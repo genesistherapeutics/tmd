@@ -750,7 +750,7 @@ def test_hrex_batching_determinism(dt, seed):
 @pytest.mark.nocuda
 @pytest.mark.parametrize("batch_simulations", [False, True], ids=["sequential", "batched"])
 @pytest.mark.parametrize(
-    ("local_steps", "current_iteration", "expected_barostat_step", "expected_water_sampler_step"),
+    ("local_steps", "current_iteration", "expected_barostat_step", "expected_batched_water_sampler_step"),
     [
         (4, 0, 0, 0),
         (4, 6, 36, 42),
@@ -763,7 +763,7 @@ def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
     local_steps,
     current_iteration,
     expected_barostat_step,
-    expected_water_sampler_step,
+    expected_batched_water_sampler_step,
 ):
     completed_frames = 2
     iterations_per_frame = 3
@@ -830,6 +830,7 @@ def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
         )
 
     expected_call_count = 1 if batch_simulations else len(replicas)
+    expected_water_sampler_step = expected_batched_water_sampler_step if batch_simulations else expected_barostat_step
     assert [mock_call.args[0] for mock_call in barostat.set_step.call_args_list] == [
         expected_barostat_step
     ] * expected_call_count
