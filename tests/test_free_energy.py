@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pickle
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, fields, replace
 from functools import partial
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -34,6 +35,7 @@ from tmd.fe.atom_mapping import get_cores
 from tmd.fe.bar import DEFAULT_SOLVER_PROTOCOL, IndeterminateEnergyWarning, df_from_u_kln, ukln_to_ukn
 from tmd.fe.free_energy import (
     BarResult,
+    HREXCheckpoint,
     HREXParams,
     HREXSimulationResult,
     InitialState,
@@ -81,6 +83,212 @@ from tmd.potentials import (
 from tmd.potentials.potential import get_bound_potential_by_type
 from tmd.testsystems.relative import get_hif2a_ligand_pair_single_topology
 from tmd.utils import path_to_internal_file
+
+
+def make_hrex_checkpoint(
+    *,
+    n_states: int = 3,
+    n_potentials: int = 2,
+    completed_frames: int = 2,
+    iterations_per_frame: int = 2,
+) -> HREXCheckpoint:
+    replicas = [
+        CoordsVelBox(
+            np.full((4, 3), replica_idx, dtype=np.float32),
+            np.zeros((4, 3), dtype=np.float32),
+            np.eye(3, dtype=np.float32),
+        )
+        for replica_idx in range(n_states)
+    ]
+    n_completed_iterations = completed_frames * iterations_per_frame
+    permutations = [
+        list(map(ReplicaIdx, np.roll(np.arange(n_states), iteration_idx)))
+        for iteration_idx in range(n_completed_iterations)
+    ]
+
+    return HREXCheckpoint(
+        completed_frames=completed_frames,
+        hrex=HREX(replicas, permutations[-1]),
+        iterated_u_kln=np.zeros((n_potentials, n_states, n_states, completed_frames), dtype=np.float32),
+        replica_idx_by_state_by_iter=permutations,
+        fraction_accepted_by_pair_by_iter=[[(0, 1)] * (n_states - 1) for _ in range(n_completed_iterations)],
+        water_sampler_proposals_by_state_by_iter=[[(0, 0)] * n_states for _ in range(n_completed_iterations)],
+    )
+
+
+def test_hrex_checkpoint_state_is_frozen_pickleable_and_trajectory_free():
+    checkpoint = make_hrex_checkpoint()
+
+    restored = pickle.loads(pickle.dumps(checkpoint))
+
+    assert restored.completed_frames == checkpoint.completed_frames
+    assert restored.hrex.replica_idx_by_state == checkpoint.hrex.replica_idx_by_state
+    for restored_replica, replica in zip(restored.hrex.replicas, checkpoint.hrex.replicas):
+        np.testing.assert_array_equal(restored_replica.coords, replica.coords)
+        np.testing.assert_array_equal(restored_replica.velocities, replica.velocities)
+        np.testing.assert_array_equal(restored_replica.box, replica.box)
+    np.testing.assert_array_equal(restored.iterated_u_kln, checkpoint.iterated_u_kln)
+    assert restored.replica_idx_by_state_by_iter == checkpoint.replica_idx_by_state_by_iter
+    assert restored.fraction_accepted_by_pair_by_iter == checkpoint.fraction_accepted_by_pair_by_iter
+    assert restored.water_sampler_proposals_by_state_by_iter == checkpoint.water_sampler_proposals_by_state_by_iter
+    assert {field.name for field in fields(checkpoint)} == {
+        "version",
+        "completed_frames",
+        "hrex",
+        "iterated_u_kln",
+        "replica_idx_by_state_by_iter",
+        "fraction_accepted_by_pair_by_iter",
+        "water_sampler_proposals_by_state_by_iter",
+    }
+    with pytest.raises(FrozenInstanceError):
+        checkpoint.completed_frames = 3
+
+
+def test_hrex_checkpoint_state_validates_requested_simulation():
+    checkpoint = make_hrex_checkpoint()
+    md_params = MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2))
+
+    checkpoint.validate(n_states=3, n_potentials=2, md_params=md_params)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "n_states", "n_potentials", "md_params", "message"),
+    [
+        (
+            replace(make_hrex_checkpoint(), version=2),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "version",
+        ),
+        (
+            make_hrex_checkpoint(),
+            2,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "replicas",
+        ),
+        (
+            make_hrex_checkpoint(),
+            3,
+            1,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "iterated_u_kln",
+        ),
+        (
+            replace(make_hrex_checkpoint(), completed_frames=5),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "completed_frames",
+        ),
+        (
+            replace(make_hrex_checkpoint(), iterated_u_kln=np.zeros((2, 3, 2, 2))),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "iterated_u_kln",
+        ),
+        (
+            replace(
+                make_hrex_checkpoint(), replica_idx_by_state_by_iter=[[ReplicaIdx(0), ReplicaIdx(1), ReplicaIdx(2)]]
+            ),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "replica permutation history",
+        ),
+        (
+            replace(make_hrex_checkpoint(), fraction_accepted_by_pair_by_iter=[[(0, 1), (0, 1)]]),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "swap-count history",
+        ),
+        (
+            replace(
+                make_hrex_checkpoint(),
+                fraction_accepted_by_pair_by_iter=[
+                    [(0, 1, 2), (0, 1)],
+                    *make_hrex_checkpoint().fraction_accepted_by_pair_by_iter[1:],
+                ],
+            ),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "swap-count history",
+        ),
+        (
+            replace(make_hrex_checkpoint(), water_sampler_proposals_by_state_by_iter=[[(0, 0)] * 3]),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "water-proposal history",
+        ),
+        (
+            replace(
+                make_hrex_checkpoint(),
+                water_sampler_proposals_by_state_by_iter=[
+                    [(0, 0, 0), (0, 0), (0, 0)],
+                    *make_hrex_checkpoint().water_sampler_proposals_by_state_by_iter[1:],
+                ],
+            ),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "water-proposal history",
+        ),
+        (
+            replace(
+                make_hrex_checkpoint(),
+                hrex=replace(make_hrex_checkpoint().hrex, replica_idx_by_state=[ReplicaIdx(0)] * 3),
+            ),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "current replica permutation",
+        ),
+        (
+            replace(
+                make_hrex_checkpoint(),
+                replica_idx_by_state_by_iter=[
+                    [ReplicaIdx(0)] * 3,
+                    *make_hrex_checkpoint().replica_idx_by_state_by_iter[1:],
+                ],
+            ),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "replica permutation history",
+        ),
+        (
+            make_hrex_checkpoint(),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=1)),
+            "replica permutation history",
+        ),
+        (
+            replace(
+                make_hrex_checkpoint(),
+                hrex=replace(
+                    make_hrex_checkpoint().hrex,
+                    replicas=[
+                        CoordsVelBox(np.zeros((4, 2)), np.zeros((4, 2)), np.eye(3)),
+                        *make_hrex_checkpoint().hrex.replicas[1:],
+                    ],
+                ),
+            ),
+            3,
+            2,
+            MDParams(4, 0, 1, 2026, hrex_params=HREXParams(iterations_per_frame=2)),
+            "invalid dimensions",
+        ),
+    ],
+)
+def test_hrex_checkpoint_state_rejects_malformed_state(checkpoint, n_states, n_potentials, md_params, message):
+    with pytest.raises(ValueError, match=message):
+        checkpoint.validate(n_states=n_states, n_potentials=n_potentials, md_params=md_params)
 
 
 def assert_shapes_consistent(U, coords, sys_params, box):

@@ -210,6 +210,72 @@ class MDParams:
             assert self.local_md_params.local_steps <= self.steps_per_frame
 
 
+HREX_CHECKPOINT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class HREXCheckpoint:
+    completed_frames: int
+    hrex: HREX[CoordsVelBox]
+    iterated_u_kln: NDArray
+    replica_idx_by_state_by_iter: list[list[ReplicaIdx]]
+    fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]]
+    water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]]
+    version: int = HREX_CHECKPOINT_VERSION
+
+    def validate(self, n_states: int, n_potentials: int, md_params: MDParams) -> None:
+        if self.version != HREX_CHECKPOINT_VERSION:
+            raise ValueError(f"Unsupported HREX checkpoint version: {self.version}")
+        if md_params.hrex_params is None:
+            raise ValueError("HREX checkpoint requires HREX parameters")
+        if not 0 <= self.completed_frames <= md_params.n_frames:
+            raise ValueError(
+                f"HREX checkpoint completed_frames must be between 0 and {md_params.n_frames}, "
+                f"got {self.completed_frames}"
+            )
+        if len(self.hrex.replicas) != n_states:
+            raise ValueError(f"HREX checkpoint has {len(self.hrex.replicas)} replicas, expected {n_states}")
+
+        for replica in self.hrex.replicas:
+            if (
+                np.ndim(replica.coords) != 2
+                or np.shape(replica.coords)[-1] != 3
+                or np.shape(replica.velocities) != np.shape(replica.coords)
+                or np.shape(replica.box) != (3, 3)
+            ):
+                raise ValueError("HREX checkpoint replica coordinates, velocities, or box have invalid dimensions")
+
+        expected_permutation = list(range(n_states))
+        if sorted(self.hrex.replica_idx_by_state) != expected_permutation:
+            raise ValueError("HREX checkpoint current replica permutation is invalid")
+
+        expected_u_kln_shape = (n_potentials, n_states, n_states, self.completed_frames)
+        if self.iterated_u_kln.shape != expected_u_kln_shape:
+            raise ValueError(
+                f"HREX checkpoint iterated_u_kln has shape {self.iterated_u_kln.shape}, expected {expected_u_kln_shape}"
+            )
+
+        n_completed_iterations = self.completed_frames * md_params.hrex_params.iterations_per_frame
+        if len(self.replica_idx_by_state_by_iter) != n_completed_iterations or any(
+            sorted(permutation) != expected_permutation for permutation in self.replica_idx_by_state_by_iter
+        ):
+            raise ValueError(
+                "HREX checkpoint replica permutation history must contain one valid permutation per completed iteration"
+            )
+
+        if len(self.fraction_accepted_by_pair_by_iter) != n_completed_iterations or any(
+            len(counts_by_pair) != n_states - 1 or any(len(counts) != 2 for counts in counts_by_pair)
+            for counts_by_pair in self.fraction_accepted_by_pair_by_iter
+        ):
+            raise ValueError("HREX checkpoint swap-count history has invalid dimensions")
+
+        if len(self.water_sampler_proposals_by_state_by_iter) != n_completed_iterations or any(
+            len(counts_by_state) != n_states or any(len(counts) != 2 for counts in counts_by_state)
+            for counts_by_state in self.water_sampler_proposals_by_state_by_iter
+        ):
+            raise ValueError("HREX checkpoint water-proposal history has invalid dimensions")
+
+
 @dataclass
 class InitialState:
     """
