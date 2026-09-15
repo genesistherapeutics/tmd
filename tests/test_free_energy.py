@@ -56,6 +56,7 @@ from tmd.fe.free_energy import (
     make_pair_bar_plots,
     run_sims_bisection,
     run_sims_hrex,
+    run_sims_hrex_iter,
     sample,
     trajectories_by_replica_to_by_state,
     verify_and_sanitize_potential_matrix,
@@ -313,6 +314,13 @@ def test_hrex_checkpoint_state_rejects_replica_atom_shape_mismatch(replica_idx, 
 def test_hrex_checkpoint_state_rejects_malformed_state(checkpoint, n_states, n_potentials, md_params, message):
     with pytest.raises(ValueError, match=message):
         checkpoint.validate(n_states=n_states, n_potentials=n_potentials, n_atoms=4, md_params=md_params)
+
+
+def test_hrex_checkpoint_interval_must_be_positive():
+    md_params = MDParams(1, 0, 1, 2026, hrex_params=HREXParams())
+
+    with pytest.raises(ValueError, match="checkpoint_interval_frames"):
+        next(run_sims_hrex_iter([], md_params, checkpoint_interval_frames=0))
 
 
 def assert_shapes_consistent(U, coords, sys_params, box):
@@ -715,6 +723,92 @@ def test_hrex_batching_determinism(dt, seed):
     for batch_sample, ref_sample in zip(batch_samples_by_state, ref_samples_by_state):
         np.testing.assert_equal(np.array(batch_sample.frames), np.array(ref_sample.frames))
         np.testing.assert_equal(np.array(batch_sample.boxes), np.array(ref_sample.boxes))
+
+
+def test_hrex_checkpoint_forced_stop_and_resume():
+    lambdas = np.linspace(0.0, 0.1, 4)
+    forcefield = Forcefield.load_default()
+    mol_a, mol_b, core = get_hif2a_ligand_pair_single_topology()
+    single_topology = SingleTopology(mol_a, mol_b, core, forcefield)
+    initial_states = setup_initial_states(
+        single_topology,
+        None,
+        DEFAULT_TEMP,
+        lambdas,
+        seed=2026,
+        verify_constraints=False,
+        min_cutoff=None,
+        dt=1e-3,
+    )
+    initial_states = [
+        replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
+        for initial_state in initial_states
+    ]
+    md_params = replace(
+        DEFAULT_HREX_PARAMS,
+        n_frames=4,
+        hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=2),
+    )
+
+    reference_result = run_sims_hrex(initial_states, md_params, print_diagnostics_interval=None)
+
+    interrupted = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+    )
+    halfway_checkpoint = next(interrupted)
+    interrupted.close()
+
+    resumed = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+        resume_state=halfway_checkpoint,
+    )
+    final_checkpoint = next(resumed)
+    with pytest.raises(StopIteration) as completed:
+        next(resumed)
+    resumed_result = completed.value.value
+
+    assert halfway_checkpoint.completed_frames == 2
+    assert final_checkpoint.completed_frames == md_params.n_frames
+    n_potentials = len(initial_states[0].potentials)
+    assert halfway_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, 2)
+    assert final_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, md_params.n_frames)
+    assert len(halfway_checkpoint.replica_idx_by_state_by_iter) == 4
+    assert len(final_checkpoint.replica_idx_by_state_by_iter) == 8
+    assert len(final_checkpoint.fraction_accepted_by_pair_by_iter) == 8
+    assert len(final_checkpoint.water_sampler_proposals_by_state_by_iter) == 8
+    np.testing.assert_equal(
+        final_checkpoint.iterated_u_kln[..., : halfway_checkpoint.completed_frames],
+        halfway_checkpoint.iterated_u_kln,
+    )
+    assert final_checkpoint.replica_idx_by_state_by_iter[:4] == halfway_checkpoint.replica_idx_by_state_by_iter
+    assert (
+        final_checkpoint.fraction_accepted_by_pair_by_iter[:4] == halfway_checkpoint.fraction_accepted_by_pair_by_iter
+    )
+    assert (
+        final_checkpoint.water_sampler_proposals_by_state_by_iter[:4]
+        == halfway_checkpoint.water_sampler_proposals_by_state_by_iter
+    )
+
+    reference_pair_bar_result, _, reference_hrex_diagnostics, reference_ws_diagnostics = reference_result
+    resumed_pair_bar_result, _, resumed_hrex_diagnostics, resumed_ws_diagnostics = resumed_result
+    np.testing.assert_equal(
+        resumed_pair_bar_result.u_kln_by_component_by_lambda,
+        reference_pair_bar_result.u_kln_by_component_by_lambda,
+    )
+    assert (
+        resumed_hrex_diagnostics.replica_idx_by_state_by_iter == reference_hrex_diagnostics.replica_idx_by_state_by_iter
+    )
+    assert (
+        resumed_hrex_diagnostics.fraction_accepted_by_pair_by_iter
+        == reference_hrex_diagnostics.fraction_accepted_by_pair_by_iter
+    )
+    assert resumed_ws_diagnostics == reference_ws_diagnostics
 
 
 @pytest.mark.parametrize("seed", [2024])
