@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 import numpy as np
 import pytest
@@ -14,6 +14,15 @@ from tmd.fe.rbfe import (
     run_solvent,
     run_vacuum,
 )
+
+
+@dataclass
+class StubInitialState:
+    lamb: float
+    x0: object = None
+    v0: object = None
+    box0: object = None
+    barostat: object = None
 
 
 def make_hrex_md_params() -> MDParams:
@@ -156,15 +165,6 @@ def test_rbfe_leg_forwards_checkpoint_arguments(leg_name):
     assert estimate.call_args.kwargs["checkpoint_callback"] is checkpoint_callback
 
 
-@dataclass
-class StubInitialState:
-    lamb: float
-    x0: object = None
-    v0: object = None
-    box0: object = None
-    barostat: object = None
-
-
 def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resumes():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
@@ -219,3 +219,46 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
     assert result.final_result is pair_bar_result
     assert result.trajectories is production_trajectories
     assert result.hrex_diagnostics is hrex_diagnostics
+
+
+def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback():
+    md_params = make_hrex_md_params()
+    checkpoint = Mock(spec=HREXCheckpoint)
+    checkpoint_callback = Mock(side_effect=StopIteration("callback stopped"))
+    initial_states = [StubInitialState(0.0), StubInitialState(1.0)]
+    trajectories = [
+        SimpleNamespace(
+            frames=[np.zeros((1, 3))],
+            boxes=[np.eye(3)],
+            final_velocities=np.zeros((1, 3)),
+            final_barostat_volume_scale_factor=None,
+        )
+        for _ in initial_states
+    ]
+    bisection_result = SimpleNamespace(initial_states=initial_states)
+
+    def run_checkpointing_hrex(*args, **kwargs):
+        yield checkpoint
+        raise AssertionError("checkpoint callback did not stop HREX result consumption")
+
+    with (
+        patch("tmd.fe.rbfe.run_sims_bisection", return_value=([bisection_result], trajectories)),
+        patch("tmd.fe.rbfe.run_sims_hrex_iter", side_effect=run_checkpointing_hrex),
+        patch("tmd.fe.rbfe.pickle.dump"),
+        patch("builtins.open", mock_open()),
+        pytest.raises(StopIteration, match="callback stopped"),
+    ):
+        estimate_relative_free_energy_bisection_hrex_impl(
+            temperature=300.0,
+            lambda_min=0.0,
+            lambda_max=1.0,
+            md_params=md_params,
+            n_windows=2,
+            make_initial_state_fn=Mock(),
+            optimize_initial_state_fn=Mock(),
+            combined_prefix="checkpoint",
+            checkpoint_interval_frames=1,
+            checkpoint_callback=checkpoint_callback,
+        )
+
+    checkpoint_callback.assert_called_once_with(checkpoint)

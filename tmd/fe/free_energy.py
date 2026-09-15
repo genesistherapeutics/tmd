@@ -17,6 +17,7 @@ import time
 from collections.abc import Generator, Iterator, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from functools import cache
+from numbers import Integral
 from typing import Callable, Optional
 from warnings import warn
 
@@ -66,6 +67,8 @@ from tmd.potentials import (
 )
 from tmd.potentials.potential import get_bound_potential_by_type
 from tmd.utils import batches
+
+HREX_CHECKPOINT_VERSION = 1
 
 WATER_SAMPLER_MOVERS = (
     custom_ops.TIBDExchangeMove_f32,
@@ -210,9 +213,6 @@ class MDParams:
             assert self.local_md_params.local_steps <= self.steps_per_frame
 
 
-HREX_CHECKPOINT_VERSION = 1
-
-
 @dataclass(frozen=True)
 class HREXCheckpoint:
     completed_frames: int
@@ -269,12 +269,24 @@ class HREXCheckpoint:
             for counts_by_pair in self.fraction_accepted_by_pair_by_iter
         ):
             raise ValueError("HREX checkpoint swap-count history has invalid dimensions")
+        if any(
+            not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
+            for counts_by_pair in self.fraction_accepted_by_pair_by_iter
+            for accepted, proposed in counts_by_pair
+        ):
+            raise ValueError("HREX checkpoint swap-count history contains invalid acceptance/proposal counts")
 
         if len(self.water_sampler_proposals_by_state_by_iter) != n_completed_iterations or any(
             len(counts_by_state) != n_states or any(len(counts) != 2 for counts in counts_by_state)
             for counts_by_state in self.water_sampler_proposals_by_state_by_iter
         ):
             raise ValueError("HREX checkpoint water-proposal history has invalid dimensions")
+        if any(
+            not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
+            for counts_by_state in self.water_sampler_proposals_by_state_by_iter
+            for accepted, proposed in counts_by_state
+        ):
+            raise ValueError("HREX checkpoint water-proposal history contains invalid acceptance/proposal counts")
 
 
 @dataclass
@@ -480,6 +492,10 @@ class HREXSimulationResult(SimulationResult):
             Indices of atoms to extract
         """
 
+        n_frames = len(self.trajectories[0].frames)
+        if n_frames == 0:
+            return np.empty((len(self.trajectories), 0, len(atom_idxs), 3), dtype=np.float32)
+
         # (states, frames, atoms, 3)
         # NOTE: chunk[:, atom_idxs] below returns a copy (rather than a view) due to the use of "advanced indexing".
         # This is important because otherwise we would try to store all of the whole-system frames in memory at once.
@@ -490,7 +506,10 @@ class HREXSimulationResult(SimulationResult):
             ]
         )
 
-        replica_idx_by_iter_by_state = np.asarray(self.hrex_diagnostics.replica_idx_by_state_by_iter).T
+        n_trajectory_iterations = n_frames * self.iterations_per_frame
+        replica_idx_by_iter_by_state = np.asarray(
+            self.hrex_diagnostics.replica_idx_by_state_by_iter[-n_trajectory_iterations:]
+        ).T
         state_idx_by_iter_by_replica = np.argsort(replica_idx_by_iter_by_state, axis=0)
 
         # (replicas, frames, atoms, 3)
@@ -2199,9 +2218,12 @@ def run_sequential_hrex_step(
             bp.set_params(params_by_state_by_pot[i][state_idx])
 
         # Movers are not called during local steps, so if local moves are mixed in need to account only for global steps
-        current_mover_step = current_frame * md_params.steps_per_frame
-        if md_params.local_md_params is not None:
-            current_mover_step = current_frame * (md_params.steps_per_frame - md_params.local_md_params.local_steps)
+        current_mover_step = 0
+        if current_frame > 0:
+            global_steps_per_iteration = md_params.steps_per_frame
+            if md_params.local_md_params is not None:
+                global_steps_per_iteration -= md_params.local_md_params.local_steps
+            current_mover_step = md_params.n_eq_steps + current_frame * global_steps_per_iteration
         # Setup the MC movers of the Context
         starting_water_acceptances = 0
         starting_water_proposals = 0
@@ -2293,9 +2315,12 @@ def run_batched_hrex_step(
             bp.set_params(params)
 
     # Setup the MC movers of the Context
-    current_mover_step = current_frame * md_params.steps_per_frame
-    if md_params.local_md_params is not None:
-        current_mover_step = current_frame * (md_params.steps_per_frame - md_params.local_md_params.local_steps)
+    current_mover_step = 0
+    if current_frame > 0:
+        global_steps_per_iteration = md_params.steps_per_frame
+        if md_params.local_md_params is not None:
+            global_steps_per_iteration -= md_params.local_md_params.local_steps
+        current_mover_step = md_params.n_eq_steps + current_frame * global_steps_per_iteration
 
     if water_sampler is not None:
         accepted = np.asarray(water_sampler.n_accepted())[state_to_replica]
@@ -2391,7 +2416,7 @@ def run_sims_hrex_iter(
         Number of nearest-neighbor swaps to attempt per iteration. Defaults to len(initial_states) ** 4.
 
     print_diagnostics_interval: int or None, optional
-        If not None, print diagnostics every N iterations
+        If not None, print diagnostics every N completed frames
 
     batch_simulations: bool
         Run simulations in batch mode. May result in GPU running out of memory
@@ -2400,11 +2425,12 @@ def run_sims_hrex_iter(
         Checkpoint containing the completed production prefix to resume
 
     checkpoint_interval_frames: int or None
-        Yield a checkpoint after every N completed frames. None disables checkpointing.
+        Yield a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
+        does not force a checkpoint. None disables checkpointing.
 
     The generator returns the same result tuple as :py:func:`run_sims_hrex` when exhausted.
-    Because checkpoints omit historical coordinate and box trajectories, a resumed generator returns only the
-    post-checkpoint trajectory suffix.
+    A resumed generator returns only the trajectory suffix sampled after ``resume_state.completed_frames`` because
+    checkpoints omit historical coordinate and box trajectories.
     """
 
     if checkpoint_interval_frames is not None and checkpoint_interval_frames <= 0:
@@ -2641,7 +2667,39 @@ def run_sims_hrex(
     print_diagnostics_interval: Optional[int] = 10,
     batch_simulations: bool = False,
 ) -> tuple[PairBarResult, list[Trajectory], HREXDiagnostics, WaterSamplingDiagnostics | None]:
-    """Sample from a sequence of states using nearest-neighbor HREX."""
+    r"""Sample from a sequence of states using nearest-neighbor Hamiltonian Replica EXchange (HREX).
+
+    See documentation for :py:func:`tmd.md.hrex.run_hrex` for details of the algorithm and implementation.
+
+    Parameters
+    ----------
+    initial_states: sequence of InitialState
+        States to sample. Should be ordered such that adjacent states have significant overlap for good mixing
+        performance
+
+    md_params: MDParams
+        MD parameters
+
+    n_swap_attempts_per_iter: int or None, optional
+        Number of nearest-neighbor swaps to attempt per iteration. Defaults to len(initial_states) ** 4.
+
+    print_diagnostics_interval: int or None, optional
+        If not None, print diagnostics every N completed frames
+
+    batch_simulations: bool
+        Run simulations in batch mode. May result in GPU running out of memory
+
+    Returns
+    -------
+    PairBarResult
+        results of pair BAR free energy analysis
+
+    list of Trajectory
+        Trajectory for each state
+
+    HREXDiagnostics
+        HREX statistics (e.g. swap rates, replica-state distribution)
+    """
     results = run_sims_hrex_iter(
         initial_states,
         md_params,

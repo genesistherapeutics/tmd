@@ -761,12 +761,27 @@ def estimate_relative_free_energy_bisection_or_hrex(
     checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
     **kwargs,
 ) -> SimulationResult:
-    """
-    See `estimate_relative_free_energy_bisection` for parameters.
+    """Dispatch to bisection with or without HREX according to ``md_params.hrex_params``.
 
-    Will call `estimate_relative_free_energy_bisection` or `estimate_relative_free_energy_bisection_hrex`
-    as appropriate given md_params.
+    See :py:func:`estimate_relative_free_energy_bisection` for shared parameters.
 
+    Parameters
+    ----------
+    resume_state: HREXCheckpoint or None
+        Checkpoint containing the completed HREX production prefix to resume. Returned trajectories contain only the
+        post-resume suffix.
+
+    checkpoint_interval_frames: int or None
+        Generate a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
+        does not force a checkpoint. None disables checkpoint generation.
+
+    checkpoint_callback: callable(HREXCheckpoint) or None
+        Called synchronously for each generated checkpoint.
+
+    Raises
+    ------
+    ValueError
+        If a checkpoint argument is provided when ``md_params.hrex_params`` is None.
     """
     hrex_params = kwargs["md_params"].hrex_params
 
@@ -979,13 +994,15 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         value. When given, the final number of windows may be less than or equal to n_windows.
 
     resume_state: HREXCheckpoint or None
-        Checkpoint containing the completed production prefix to resume.
+        Checkpoint containing the completed production prefix to resume. Returned trajectories contain only the
+        post-resume suffix.
 
     checkpoint_interval_frames: int or None
-        Yield a checkpoint after every N completed production frames. None disables checkpointing.
+        Generate a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
+        does not force a checkpoint. None disables checkpoint generation.
 
     checkpoint_callback: callable(HREXCheckpoint) or None
-        Called synchronously for every yielded checkpoint.
+        Called synchronously for each generated checkpoint.
 
     Returns
     -------
@@ -1127,13 +1144,14 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             resume_state=resume_state,
             checkpoint_interval_frames=checkpoint_interval_frames,
         )
-        try:
-            while True:
+        while True:
+            try:
                 checkpoint = next(hrex_results)
-                if checkpoint_callback is not None:
-                    checkpoint_callback(checkpoint)
-        except StopIteration as completed:
-            pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = completed.value
+            except StopIteration as completed:
+                pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = completed.value
+                break
+            if checkpoint_callback is not None:
+                checkpoint_callback(checkpoint)
         print(f"[TIMER] production_hrex {time.perf_counter() - t0:.2f}s", flush=True)
 
         t0 = time.perf_counter()
@@ -1209,7 +1227,7 @@ def estimate_relative_free_energy_bisection_hrex(
         Configuration for the host system. If None, then the vacuum leg is run.
 
     md_params: MDParams, optional
-        Parameters for the equilibration and production MD. Defaults to :py:const:`tmd.fe.rbfe.DEFAULT_MD_PARAMS`
+        Parameters for the equilibration and production MD. Defaults to :py:const:`tmd.fe.rbfe.DEFAULT_HREX_PARAMS`
 
     prefix: str, optional
         A prefix to append to figures
@@ -1233,13 +1251,15 @@ def estimate_relative_free_energy_bisection_hrex(
         Temperature (Kelvin) to run simulation at, defaults to tmd.constants.DEFAULT_TEMP
 
     resume_state: HREXCheckpoint or None
-        Checkpoint containing the completed production prefix to resume.
+        Checkpoint containing the completed production prefix to resume. Returned trajectories contain only the
+        post-resume suffix.
 
     checkpoint_interval_frames: int or None
-        Yield a checkpoint after every N completed production frames. None disables checkpointing.
+        Generate a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
+        does not force a checkpoint. None disables checkpoint generation.
 
     checkpoint_callback: callable(HREXCheckpoint) or None
-        Called synchronously for every yielded checkpoint.
+        Called synchronously for each generated checkpoint.
 
     Returns
     -------
