@@ -2293,6 +2293,10 @@ def run_batched_hrex_step(
             bp.set_params(params)
 
     # Setup the MC movers of the Context
+    current_mover_step = current_frame * md_params.steps_per_frame
+    if md_params.local_md_params is not None:
+        current_mover_step = current_frame * (md_params.steps_per_frame - md_params.local_md_params.local_steps)
+
     if water_sampler is not None:
         accepted = np.asarray(water_sampler.n_accepted())[state_to_replica]
         proposed = np.asarray(water_sampler.n_proposed())[state_to_replica]
@@ -2301,6 +2305,9 @@ def run_batched_hrex_step(
 
         assert water_params_by_state is not None
         water_sampler.set_params(water_params_by_state[state_to_replica])
+        water_sampler.set_step(current_mover_step)
+    if barostat is not None:
+        barostat.set_step(current_mover_step)
 
     md_params_replica = replace(
         md_params,
@@ -2396,6 +2403,8 @@ def run_sims_hrex_iter(
         Yield a checkpoint after every N completed frames. None disables checkpointing.
 
     The generator returns the same result tuple as :py:func:`run_sims_hrex` when exhausted.
+    Because checkpoints omit historical coordinate and box trajectories, a resumed generator returns only the
+    post-checkpoint trajectory suffix.
     """
 
     if checkpoint_interval_frames is not None and checkpoint_interval_frames <= 0:

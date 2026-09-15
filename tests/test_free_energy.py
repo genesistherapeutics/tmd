@@ -725,6 +725,64 @@ def test_hrex_batching_determinism(dt, seed):
         np.testing.assert_equal(np.array(batch_sample.boxes), np.array(ref_sample.boxes))
 
 
+@pytest.mark.nocuda
+def test_hrex_checkpoint_batched_resume_restores_mover_absolute_step():
+    completed_frames = 2
+    iterations_per_frame = 3
+    absolute_iteration = completed_frames * iterations_per_frame
+    md_params = MDParams(
+        n_frames=4,
+        n_eq_steps=0,
+        steps_per_frame=10,
+        seed=2026,
+        local_md_params=LocalMDParams(local_steps=4),
+        hrex_params=HREXParams(iterations_per_frame=iterations_per_frame),
+        water_sampling_params=WaterSamplingParams(),
+    )
+    replicas = [
+        CoordsVelBox(np.zeros((1, 3)), np.zeros((1, 3)), np.eye(3)),
+        CoordsVelBox(np.ones((1, 3)), np.zeros((1, 3)), np.eye(3)),
+    ]
+    hrex = HREX.from_replicas(replicas)
+
+    barostat = Mock()
+    barostat.get_volume_scale_factor.return_value = [1.0, 1.0]
+    water_sampler = Mock()
+    water_sampler.n_accepted.return_value = [0, 0]
+    water_sampler.n_proposed.return_value = [0, 0]
+    context = Mock()
+    context.get_potentials.return_value = []
+    context.get_barostat.return_value = barostat
+    context.get_movers.return_value = [water_sampler, barostat]
+
+    sampled_frames = np.stack([[replica.coords for replica in replicas]])
+    sampled_boxes = np.stack([[replica.box for replica in replicas]])
+    final_velocities = np.stack([replica.velocities for replica in replicas])
+    with (
+        patch("tmd.fe.free_energy.WATER_SAMPLER_MOVERS", (type(water_sampler),)),
+        patch(
+            "tmd.fe.free_energy.sample_with_context_iter",
+            return_value=iter([(sampled_frames, sampled_boxes, final_velocities)]),
+        ),
+        patch("tmd.fe.free_energy.batch_compute_potential_matrix", return_value=np.empty((0, 2, 2))),
+    ):
+        free_energy.run_batched_hrex_step(
+            hrex,
+            [],
+            [],
+            np.zeros((2, 1, 4)),
+            context,
+            md_params,
+            np.array([], dtype=np.int32),
+            DEFAULT_TEMP,
+            absolute_iteration,
+        )
+
+    expected_global_step = absolute_iteration * (md_params.steps_per_frame - md_params.local_md_params.local_steps)
+    barostat.set_step.assert_called_once_with(expected_global_step)
+    water_sampler.set_step.assert_called_once_with(expected_global_step)
+
+
 def test_hrex_checkpoint_forced_stop_and_resume():
     lambdas = np.linspace(0.0, 0.1, 4)
     forcefield = Forcefield.load_default()
@@ -795,8 +853,21 @@ def test_hrex_checkpoint_forced_stop_and_resume():
         == halfway_checkpoint.water_sampler_proposals_by_state_by_iter
     )
 
-    reference_pair_bar_result, _, reference_hrex_diagnostics, reference_ws_diagnostics = reference_result
-    resumed_pair_bar_result, _, resumed_hrex_diagnostics, resumed_ws_diagnostics = resumed_result
+    reference_pair_bar_result, reference_samples, reference_hrex_diagnostics, reference_ws_diagnostics = (
+        reference_result
+    )
+    resumed_pair_bar_result, resumed_samples, resumed_hrex_diagnostics, resumed_ws_diagnostics = resumed_result
+    expected_resumed_frames = md_params.n_frames - halfway_checkpoint.completed_frames
+    for reference_sample, resumed_sample in zip(reference_samples, resumed_samples):
+        assert len(resumed_sample.frames) == expected_resumed_frames
+        np.testing.assert_equal(
+            np.array(resumed_sample.frames),
+            np.array(reference_sample.frames)[halfway_checkpoint.completed_frames :],
+        )
+        np.testing.assert_equal(
+            np.array(resumed_sample.boxes),
+            np.array(reference_sample.boxes)[halfway_checkpoint.completed_frames :],
+        )
     np.testing.assert_equal(
         resumed_pair_bar_result.u_kln_by_component_by_lambda,
         reference_pair_bar_result.u_kln_by_component_by_lambda,
