@@ -12,7 +12,7 @@ concurrency:
 jobs:
 
   lint:
-    runs-on: self-hosted
+    runs-on: [self-hosted, gpu]
     strategy:
       matrix:
         python-version: ["3.12"]
