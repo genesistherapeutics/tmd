@@ -750,12 +750,20 @@ def test_hrex_batching_determinism(dt, seed):
 @pytest.mark.nocuda
 @pytest.mark.parametrize("batch_simulations", [False, True], ids=["sequential", "batched"])
 @pytest.mark.parametrize(
-    ("current_iteration", "expected_mover_step"),
-    [(0, 0), (6, 43)],
-    ids=["fresh", "resumed"],
+    ("local_steps", "current_iteration", "expected_barostat_step", "expected_water_sampler_step"),
+    [
+        (4, 0, 0, 0),
+        (4, 6, 36, 42),
+        (None, 6, 60, 67),
+    ],
+    ids=["fresh-local", "resumed-local", "resumed-global"],
 )
 def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
-    batch_simulations, current_iteration, expected_mover_step
+    batch_simulations,
+    local_steps,
+    current_iteration,
+    expected_barostat_step,
+    expected_water_sampler_step,
 ):
     completed_frames = 2
     iterations_per_frame = 3
@@ -765,7 +773,7 @@ def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
         n_eq_steps=7,
         steps_per_frame=10,
         seed=2026,
-        local_md_params=LocalMDParams(local_steps=4),
+        local_md_params=LocalMDParams(local_steps=local_steps) if local_steps is not None else None,
         hrex_params=HREXParams(iterations_per_frame=iterations_per_frame),
         water_sampling_params=WaterSamplingParams(),
     )
@@ -823,10 +831,10 @@ def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
 
     expected_call_count = 1 if batch_simulations else len(replicas)
     assert [mock_call.args[0] for mock_call in barostat.set_step.call_args_list] == [
-        expected_mover_step
+        expected_barostat_step
     ] * expected_call_count
     assert [mock_call.args[0] for mock_call in water_sampler.set_step.call_args_list] == [
-        expected_mover_step
+        expected_water_sampler_step
     ] * expected_call_count
     expected_eq_steps = md_params.n_eq_steps if current_iteration == 0 else 0
     assert [mock_call.args[1].n_eq_steps for mock_call in sample_with_context_iter.call_args_list] == [
@@ -1475,6 +1483,7 @@ def test_hrex_checkpoint_extract_trajectories_aligns_full_diagnostics_to_resumed
     n_states = 2
     n_atoms = 3
     n_total_frames = 3
+    iterations_per_frame = 2
     frames = np.arange(n_states * n_total_frames * n_atoms * 3, dtype=np.float32).reshape(
         n_states, n_total_frames, n_atoms, 3
     )
@@ -1491,7 +1500,10 @@ def test_hrex_checkpoint_extract_trajectories_aligns_full_diagnostics_to_resumed
     replica_idx_by_state_by_iter = [
         [ReplicaIdx(0), ReplicaIdx(1)],
         [ReplicaIdx(1), ReplicaIdx(0)],
+        [ReplicaIdx(1), ReplicaIdx(0)],
         [ReplicaIdx(0), ReplicaIdx(1)],
+        [ReplicaIdx(0), ReplicaIdx(1)],
+        [ReplicaIdx(1), ReplicaIdx(0)],
     ]
     result = HREXSimulationResult(
         final_result=Mock(),
@@ -1501,6 +1513,7 @@ def test_hrex_checkpoint_extract_trajectories_aligns_full_diagnostics_to_resumed
         md_params=Mock(),
         intermediate_results=[Mock()],
         hrex_diagnostics=HREXDiagnostics(replica_idx_by_state_by_iter, []),
+        iterations_per_frame=iterations_per_frame,
     )
     atom_idxs = np.array([0, 2])
 
@@ -1509,7 +1522,8 @@ def test_hrex_checkpoint_extract_trajectories_aligns_full_diagnostics_to_resumed
     assert trajectories_by_replica.shape == (n_states, n_suffix_frames, len(atom_idxs), 3)
     if n_suffix_frames:
         expected = np.empty_like(trajectories_by_replica)
-        for frame_idx, permutation in enumerate(replica_idx_by_state_by_iter[-n_suffix_frames:]):
+        sampled_frame_permutations = replica_idx_by_state_by_iter[iterations_per_frame - 1 :: iterations_per_frame]
+        for frame_idx, permutation in enumerate(sampled_frame_permutations[-n_suffix_frames:]):
             for state_idx, replica_idx in enumerate(permutation):
                 expected[int(replica_idx), frame_idx] = suffix_frames[state_idx, frame_idx, atom_idxs]
         np.testing.assert_array_equal(trajectories_by_replica, expected)
