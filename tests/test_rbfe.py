@@ -49,7 +49,9 @@ def make_stub_bisection_output():
     return [SimpleNamespace(initial_states=initial_states)], trajectories
 
 
-def make_production_checkpoint(completed_frames: int, initial_states_hrex=None) -> HREXCheckpoint:
+def make_production_checkpoint(
+    completed_frames: int, initial_states_hrex=None, bisection_results=None
+) -> HREXCheckpoint:
     return HREXCheckpoint(
         completed_frames=completed_frames,
         hrex=None,
@@ -58,6 +60,7 @@ def make_production_checkpoint(completed_frames: int, initial_states_hrex=None) 
         fraction_accepted_by_pair_by_iter=[],
         water_sampler_proposals_by_state_by_iter=[],
         initial_states_hrex=initial_states_hrex,
+        bisection_results=bisection_results,
     )
 
 
@@ -202,6 +205,8 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
         yield checkpoints[0]
         # callback_calls[0] is the pre-production checkpoint carrying the freshly computed schedule.
         assert callback_calls[0].completed_frames is None
+        assert callback_calls[0].initial_states_hrex is initial_states_hrex
+        assert callback_calls[0].bisection_results is bisection_output[0]
         assert callback_calls[1:] == expected[:1]
         yield checkpoints[1]
         assert callback_calls[1:] == expected
@@ -237,10 +242,12 @@ def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback(
     md_params = make_hrex_md_params()
     # A resume state with a locked schedule skips bisection, so the only checkpoint callback call is the
     # production one made from the generator below.
-    resume_state = make_production_checkpoint(1, initial_states_hrex=[StubInitialState(0.0)])
+    bisection_output = make_stub_bisection_output()
+    resume_state = make_production_checkpoint(
+        1, initial_states_hrex=[StubInitialState(0.0)], bisection_results=bisection_output[0]
+    )
     checkpoint = replace(resume_state, completed_frames=2)
     checkpoint_callback = Mock(side_effect=StopIteration("callback stopped"))
-    bisection_output = make_stub_bisection_output()
 
     def run_checkpointing_hrex(*args, **kwargs):
         yield checkpoint

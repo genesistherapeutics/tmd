@@ -37,7 +37,6 @@ from tmd.fe.free_energy import (
     HREXSimulationResult,
     InitialState,
     MDParams,
-    PairBarResult,
     RESTParams,
     SimulationResult,
     Trajectory,
@@ -1032,7 +1031,8 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         if resume_state is not None and resume_state.initial_states_hrex is not None:
             # The lambda schedule and bisection report were computed by a previous attempt; reuse them.
             initial_states_hrex = resume_state.initial_states_hrex
-            results = cast(list[PairBarResult], resume_state.bisection_results)  # required by mypy
+            assert resume_state.bisection_results is not None
+            results = resume_state.bisection_results
         else:
             # First phase: bisection to determine lambda spacing
             md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
