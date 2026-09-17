@@ -2434,7 +2434,7 @@ def run_sims_hrex_iter(
         dtype=np.float32,
     )
 
-    if resume_state is None:
+    if resume_state is None or resume_state.completed_frames is None:
         completed_frames = 0
         hrex = HREX.from_replicas([CoordsVelBox(s.x0, s.v0, s.box0) for s in initial_states])
         replica_idx_by_state_by_iter: list[list[ReplicaIdx]] = []
