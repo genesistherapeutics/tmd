@@ -212,12 +212,15 @@ class MDParams:
 
 @dataclass
 class HREXCheckpoint:
-    completed_frames: int
-    hrex: HREX[CoordsVelBox]
-    iterated_u_kln: NDArray
+    # None means no production frame has run yet — check this field, not hrex/iterated_u_kln, to detect that state
+    completed_frames: int | None
+    hrex: HREX[CoordsVelBox] | None
+    iterated_u_kln: NDArray | None
     replica_idx_by_state_by_iter: list[list[ReplicaIdx]]
     fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]]
     water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]]
+    initial_states_hrex: "Sequence[InitialState] | None" = None
+    bisection_results: "list[PairBarResult] | None" = None
 
 
 @dataclass
