@@ -35,6 +35,7 @@ from tmd.fe.atom_mapping import get_cores
 from tmd.fe.bar import DEFAULT_SOLVER_PROTOCOL, IndeterminateEnergyWarning, df_from_u_kln, ukln_to_ukn
 from tmd.fe.free_energy import (
     BarResult,
+    HREXCheckpoint,
     HREXParams,
     HREXSimulationResult,
     InitialState,
@@ -624,6 +625,8 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
         "replica_idx_by_state_by_iter",
         "fraction_accepted_by_pair_by_iter",
         "water_sampler_proposals_by_state_by_iter",
+        "initial_states_hrex",
+        "bisection_results",
     }
 
     resumed = run_sims_hrex_iter(
@@ -687,6 +690,43 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
         == reference_hrex_diagnostics.fraction_accepted_by_pair_by_iter
     )
     assert resumed_ws_diagnostics == reference_ws_diagnostics
+
+
+def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair_single_topology):
+    lambdas = np.linspace(0.0, 0.1, 4)
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = setup_initial_states(
+        single_topology,
+        None,
+        DEFAULT_TEMP,
+        lambdas,
+        seed=2026,
+        verify_constraints=False,
+        min_cutoff=None,
+        dt=1e-3,
+    )
+
+    checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=initial_states,
+        bisection_results=[],
+    )
+
+    roundtripped = pickle.loads(pickle.dumps(checkpoint))
+
+    assert roundtripped.completed_frames is None
+    assert roundtripped.hrex is None
+    assert roundtripped.iterated_u_kln is None
+    assert roundtripped.replica_idx_by_state_by_iter == []
+    assert roundtripped.fraction_accepted_by_pair_by_iter == []
+    assert roundtripped.water_sampler_proposals_by_state_by_iter == []
+    assert roundtripped.bisection_results == []
+    assert [s.lamb for s in roundtripped.initial_states_hrex] == [s.lamb for s in initial_states]
 
 
 @pytest.mark.parametrize("seed", [2024])
