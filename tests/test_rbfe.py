@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, mock_open, patch
 
@@ -49,6 +49,18 @@ def make_stub_bisection_output():
     return [SimpleNamespace(initial_states=initial_states)], trajectories
 
 
+def make_production_checkpoint(completed_frames: int, initial_states_hrex=None) -> HREXCheckpoint:
+    return HREXCheckpoint(
+        completed_frames=completed_frames,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=initial_states_hrex,
+    )
+
+
 def test_bisection_dispatch_preserves_call_without_checkpoint_arguments():
     md_params = MDParams(n_frames=1, n_eq_steps=0, steps_per_frame=1, seed=2026)
     expected_result = Mock()
@@ -63,6 +75,7 @@ def test_bisection_dispatch_preserves_call_without_checkpoint_arguments():
 def test_hrex_dispatch_forwards_checkpoint_arguments():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
+    resume_state.initial_states_hrex = None
     checkpoint_callback = Mock()
     expected_result = Mock()
 
@@ -90,6 +103,7 @@ def test_hrex_dispatch_forwards_checkpoint_arguments():
 def test_hrex_entry_point_forwards_checkpoint_arguments_to_implementation():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
+    resume_state.initial_states_hrex = None
     checkpoint_callback = Mock()
     expected_result = Mock()
     initial_states = [Mock(), Mock()]
@@ -126,6 +140,7 @@ def test_hrex_entry_point_forwards_checkpoint_arguments_to_implementation():
 def test_rbfe_leg_forwards_checkpoint_arguments(leg_name):
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
+    resume_state.initial_states_hrex = None
     checkpoint_callback = Mock()
     forcefield = SimpleNamespace(water_ff=Mock(), protein_ff=Mock())
     mol_a = Mock()
@@ -167,7 +182,8 @@ def test_rbfe_leg_forwards_checkpoint_arguments(leg_name):
 def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resumes():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
-    checkpoints = [Mock(spec=HREXCheckpoint), Mock(spec=HREXCheckpoint)]
+    resume_state.initial_states_hrex = None
+    checkpoints = [make_production_checkpoint(completed_frames) for completed_frames in (1, 2)]
     callback_calls = []
     bisection_output = make_stub_bisection_output()
     pair_bar_result = Mock()
@@ -175,13 +191,20 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
     hrex_diagnostics = Mock(transition_matrix=Mock(), cumulative_replica_state_counts=Mock())
     final_result = (pair_bar_result, production_trajectories, hrex_diagnostics, None)
 
-    def run_checkpointing_hrex(*args, **kwargs):
+    def run_checkpointing_hrex(initial_states_hrex, *args, **kwargs):
         assert kwargs["resume_state"] is resume_state
         assert kwargs["checkpoint_interval_frames"] == 1
+        # The implementation attaches the schedule and bisection report to each yielded checkpoint.
+        expected = [
+            replace(checkpoint, initial_states_hrex=initial_states_hrex, bisection_results=bisection_output[0])
+            for checkpoint in checkpoints
+        ]
         yield checkpoints[0]
-        assert callback_calls == [checkpoints[0]]
+        # callback_calls[0] is the pre-production checkpoint carrying the freshly computed schedule.
+        assert callback_calls[0].completed_frames is None
+        assert callback_calls[1:] == expected[:1]
         yield checkpoints[1]
-        assert callback_calls == checkpoints
+        assert callback_calls[1:] == expected
         return final_result
 
     with (
@@ -204,7 +227,7 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
             checkpoint_callback=callback_calls.append,
         )
 
-    assert callback_calls == checkpoints
+    assert len(callback_calls) == 3
     assert result.final_result is pair_bar_result
     assert result.trajectories is production_trajectories
     assert result.hrex_diagnostics is hrex_diagnostics
@@ -212,7 +235,10 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
 
 def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback():
     md_params = make_hrex_md_params()
-    checkpoint = Mock(spec=HREXCheckpoint)
+    # A resume state with a locked schedule skips bisection, so the only checkpoint callback call is the
+    # production one made from the generator below.
+    resume_state = make_production_checkpoint(1, initial_states_hrex=[StubInitialState(0.0)])
+    checkpoint = replace(resume_state, completed_frames=2)
     checkpoint_callback = Mock(side_effect=StopIteration("callback stopped"))
     bisection_output = make_stub_bisection_output()
 
@@ -236,6 +262,7 @@ def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback(
             make_initial_state_fn=Mock(),
             optimize_initial_state_fn=Mock(),
             combined_prefix="checkpoint",
+            resume_state=resume_state,
             checkpoint_interval_frames=1,
             checkpoint_callback=checkpoint_callback,
         )
