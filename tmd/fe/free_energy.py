@@ -17,6 +17,7 @@ import time
 from collections.abc import Generator, Iterator, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from functools import cache
+from numbers import Integral
 from typing import Callable, Optional
 from warnings import warn
 
@@ -66,6 +67,8 @@ from tmd.potentials import (
 )
 from tmd.potentials.potential import get_bound_potential_by_type
 from tmd.utils import batches
+
+HREX_CHECKPOINT_VERSION = 1
 
 WATER_SAMPLER_MOVERS = (
     custom_ops.TIBDExchangeMove_f32,
@@ -210,7 +213,7 @@ class MDParams:
             assert self.local_md_params.local_steps <= self.steps_per_frame
 
 
-@dataclass
+@dataclass(frozen=True)
 class HREXCheckpoint:
     # None means no production frame has run yet — check this field, not hrex/iterated_u_kln, to detect that state
     completed_frames: int | None
@@ -221,6 +224,82 @@ class HREXCheckpoint:
     water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]]
     initial_states_hrex: "Sequence[InitialState] | None" = None
     bisection_results: "list[PairBarResult] | None" = None
+    version: int = HREX_CHECKPOINT_VERSION
+
+    def validate(self, n_states: int, n_potentials: int, n_atoms: int, md_params: MDParams) -> None:
+        if self.version != HREX_CHECKPOINT_VERSION:
+            raise ValueError(f"Unsupported HREX checkpoint version: {self.version}")
+        if md_params.hrex_params is None:
+            raise ValueError("HREX checkpoint requires HREX parameters")
+
+        if self.completed_frames is None:
+            if self.hrex is not None or self.iterated_u_kln is not None:
+                raise ValueError("HREX checkpoint has no completed_frames but carries production state")
+            return
+
+        if not 0 <= self.completed_frames <= md_params.n_frames:
+            raise ValueError(
+                f"HREX checkpoint completed_frames must be between 0 and {md_params.n_frames}, "
+                f"got {self.completed_frames}"
+            )
+        if self.hrex is None:
+            raise ValueError("HREX checkpoint has completed_frames set but no replica state")
+        if len(self.hrex.replicas) != n_states:
+            raise ValueError(f"HREX checkpoint has {len(self.hrex.replicas)} replicas, expected {n_states}")
+
+        expected_atom_shape = (n_atoms, 3)
+        for replica in self.hrex.replicas:
+            if np.shape(replica.coords) != expected_atom_shape or np.shape(replica.velocities) != expected_atom_shape:
+                raise ValueError(
+                    "HREX checkpoint replica coordinate and velocity shapes have invalid dimensions; "
+                    f"expected {expected_atom_shape}"
+                )
+            if np.shape(replica.box) != (3, 3):
+                raise ValueError("HREX checkpoint replica box has invalid dimensions")
+
+        expected_permutation = list(range(n_states))
+        if sorted(self.hrex.replica_idx_by_state) != expected_permutation:
+            raise ValueError("HREX checkpoint current replica permutation is invalid")
+
+        if self.iterated_u_kln is None:
+            raise ValueError("HREX checkpoint has completed_frames set but no iterated_u_kln")
+        expected_u_kln_shape = (n_potentials, n_states, n_states, self.completed_frames)
+        if self.iterated_u_kln.shape != expected_u_kln_shape:
+            raise ValueError(
+                f"HREX checkpoint iterated_u_kln has shape {self.iterated_u_kln.shape}, expected {expected_u_kln_shape}"
+            )
+
+        n_completed_iterations = self.completed_frames * md_params.hrex_params.iterations_per_frame
+        if len(self.replica_idx_by_state_by_iter) != n_completed_iterations or any(
+            sorted(permutation) != expected_permutation for permutation in self.replica_idx_by_state_by_iter
+        ):
+            raise ValueError(
+                "HREX checkpoint replica permutation history must contain one valid permutation per completed iteration"
+            )
+
+        if len(self.fraction_accepted_by_pair_by_iter) != n_completed_iterations or any(
+            len(counts_by_pair) != n_states - 1 or any(len(counts) != 2 for counts in counts_by_pair)
+            for counts_by_pair in self.fraction_accepted_by_pair_by_iter
+        ):
+            raise ValueError("HREX checkpoint swap-count history has invalid dimensions")
+        if any(
+            not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
+            for counts_by_pair in self.fraction_accepted_by_pair_by_iter
+            for accepted, proposed in counts_by_pair
+        ):
+            raise ValueError("HREX checkpoint swap-count history contains invalid acceptance/proposal counts")
+
+        if len(self.water_sampler_proposals_by_state_by_iter) != n_completed_iterations or any(
+            len(counts_by_state) != n_states or any(len(counts) != 2 for counts in counts_by_state)
+            for counts_by_state in self.water_sampler_proposals_by_state_by_iter
+        ):
+            raise ValueError("HREX checkpoint water-proposal history has invalid dimensions")
+        if any(
+            not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
+            for counts_by_state in self.water_sampler_proposals_by_state_by_iter
+            for accepted, proposed in counts_by_state
+        ):
+            raise ValueError("HREX checkpoint water-proposal history contains invalid acceptance/proposal counts")
 
 
 @dataclass
@@ -2383,6 +2462,9 @@ def run_sims_hrex_iter(
     checkpoints omit historical coordinate and box trajectories.
     """
 
+    if checkpoint_interval_frames is not None and checkpoint_interval_frames <= 0:
+        raise ValueError("checkpoint_interval_frames must be positive")
+
     assert md_params.hrex_params is not None
 
     # TODO: to support replica exchange with variable temperatures,
@@ -2397,6 +2479,14 @@ def run_sims_hrex_iter(
     # state and use set_params for efficiency
     for s in initial_states[1:]:
         assert_potentials_compatible(initial_states[0].potentials, s.potentials)
+
+    if resume_state is not None:
+        resume_state.validate(
+            n_states=len(initial_states),
+            n_potentials=len(initial_states[0].potentials),
+            n_atoms=len(initial_states[0].x0),
+            md_params=md_params,
+        )
 
     # Set up overall potential and context using the first state.
     if batch_simulations:

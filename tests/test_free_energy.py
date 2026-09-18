@@ -627,6 +627,7 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
         "water_sampler_proposals_by_state_by_iter",
         "initial_states_hrex",
         "bisection_results",
+        "version",
     }
 
     resumed = run_sims_hrex_iter(
@@ -690,6 +691,69 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
         == reference_hrex_diagnostics.fraction_accepted_by_pair_by_iter
     )
     assert resumed_ws_diagnostics == reference_ws_diagnostics
+
+
+def test_hrex_checkpoint_forced_stop_and_resume_with_batch_simulations(hif2a_ligand_pair_single_topology):
+    lambdas = np.linspace(0.0, 0.1, 4)
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = setup_initial_states(
+        single_topology,
+        None,
+        DEFAULT_TEMP,
+        lambdas,
+        seed=2026,
+        verify_constraints=False,
+        min_cutoff=None,
+        dt=1e-3,
+    )
+    initial_states = [
+        replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
+        for initial_state in initial_states
+    ]
+    md_params = replace(
+        DEFAULT_HREX_PARAMS,
+        n_frames=4,
+        hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=2),
+    )
+
+    reference_result = run_sims_hrex(initial_states, md_params, print_diagnostics_interval=None, batch_simulations=True)
+
+    interrupted = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+        batch_simulations=True,
+    )
+    halfway_checkpoint = pickle.loads(pickle.dumps(next(interrupted)))
+    interrupted.close()
+
+    resumed = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+        resume_state=halfway_checkpoint,
+        batch_simulations=True,
+    )
+    next(resumed)
+    with pytest.raises(StopIteration) as completed:
+        next(resumed)
+    resumed_result = completed.value.value
+
+    reference_pair_bar_result, reference_samples, _, _ = reference_result
+    resumed_pair_bar_result, resumed_samples, _, _ = resumed_result
+    expected_resumed_frames = md_params.n_frames - halfway_checkpoint.completed_frames
+    for reference_sample, resumed_sample in zip(reference_samples, resumed_samples):
+        assert len(resumed_sample.frames) == expected_resumed_frames
+        np.testing.assert_equal(
+            np.array(resumed_sample.frames),
+            np.array(reference_sample.frames)[halfway_checkpoint.completed_frames :],
+        )
+    np.testing.assert_equal(
+        resumed_pair_bar_result.u_kln_by_component_by_lambda,
+        reference_pair_bar_result.u_kln_by_component_by_lambda,
+    )
 
 
 def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair_single_topology):

@@ -75,6 +75,13 @@ def test_bisection_dispatch_preserves_call_without_checkpoint_arguments():
     estimate.assert_called_once_with("argument", md_params=md_params)
 
 
+def test_bisection_dispatch_rejects_checkpoint_arguments_without_hrex_params():
+    md_params = MDParams(n_frames=1, n_eq_steps=0, steps_per_frame=1, seed=2026)
+
+    with pytest.raises(ValueError, match="require HREX parameters"):
+        estimate_relative_free_energy_bisection_or_hrex("argument", md_params=md_params, checkpoint_interval_frames=2)
+
+
 def test_hrex_dispatch_forwards_checkpoint_arguments():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)

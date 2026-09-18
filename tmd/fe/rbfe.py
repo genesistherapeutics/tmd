@@ -781,6 +781,11 @@ def estimate_relative_free_energy_bisection_or_hrex(
         Called synchronously for each generated checkpoint: once right after the trial phase completes (with
         production fields empty), and then once per checkpoint_interval_frames during production.
 
+    Raises
+    ------
+    ValueError
+        If a checkpoint argument is provided when ``md_params.hrex_params`` is None.
+
     """
     hrex_params = kwargs["md_params"].hrex_params
 
@@ -792,6 +797,9 @@ def estimate_relative_free_energy_bisection_or_hrex(
             checkpoint_callback=checkpoint_callback,
             **kwargs,
         )
+    checkpoint_args = (resume_state, checkpoint_interval_frames, checkpoint_callback)
+    if any(checkpoint_arg is not None for checkpoint_arg in checkpoint_args):
+        raise ValueError("HREX checkpoint arguments require HREX parameters")
     return estimate_relative_free_energy_bisection(*args, **kwargs)
 
 
