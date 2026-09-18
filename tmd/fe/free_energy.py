@@ -240,6 +240,10 @@ class HREXCheckpoint:
     water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]]
     initial_states_hrex: "Sequence[InitialState] | None" = None
     bisection_results: "list[PairBarResult] | None" = None
+    # Forward-only: a checkpoint pickled before this field existed unpickles with this class-level default, not
+    # an error, so this can't detect that legacy shape. The initial_states_hrex/bisection_results pairing check
+    # below is what actually catches it (that shape always lacks a schedule). Bump HREX_CHECKPOINT_VERSION only
+    # to reject a *future* incompatible schema change from being read by older code.
     version: int = HREX_CHECKPOINT_VERSION
 
     def validate(self, n_states: int, n_potentials: int, n_atoms: int, md_params: MDParams) -> None:

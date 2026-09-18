@@ -780,7 +780,9 @@ def estimate_relative_free_energy_bisection_or_hrex(
 
     checkpoint_callback: callable(HREXCheckpoint) or None
         Called synchronously for each generated checkpoint: once right after the trial phase completes (with
-        production fields empty), and then once per checkpoint_interval_frames during production.
+        production fields empty), and then once per checkpoint_interval_frames during production. The
+        pre-production call is skipped when resume_state already carries a locked schedule, since the trial
+        phase itself is skipped in that case.
 
     Raises
     ------
@@ -1012,7 +1014,9 @@ def estimate_relative_free_energy_bisection_hrex_impl(
 
     checkpoint_callback: callable(HREXCheckpoint) or None
         Called synchronously for each generated checkpoint: once right after the trial phase completes (with
-        production fields empty), and then once per checkpoint_interval_frames during production.
+        production fields empty), and then once per checkpoint_interval_frames during production. The
+        pre-production call is skipped when resume_state already carries a locked schedule, since the trial
+        phase itself is skipped in that case.
 
     Returns
     -------
@@ -1324,7 +1328,9 @@ def estimate_relative_free_energy_bisection_hrex(
 
     checkpoint_callback: callable(HREXCheckpoint) or None
         Called synchronously for each generated checkpoint: once right after the trial phase completes (with
-        production fields empty), and then once per checkpoint_interval_frames during production.
+        production fields empty), and then once per checkpoint_interval_frames during production. The
+        pre-production call is skipped when resume_state already carries a locked schedule, since the trial
+        phase itself is skipped in that case.
 
     Returns
     -------
