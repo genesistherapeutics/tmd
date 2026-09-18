@@ -333,4 +333,5 @@ def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume
 
     run_sims_bisection.assert_not_called()
     assert result.intermediate_results is resume_state.bisection_results
+    assert len(callback_calls) == 1
     assert not any(call.completed_frames is None for call in callback_calls)
