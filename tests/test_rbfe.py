@@ -15,6 +15,10 @@ from tmd.fe.rbfe import (
     run_vacuum,
 )
 
+# Every test in this file mocks out the real bisection/HREX simulation calls; none needs a GPU. tmd.fe.rbfe
+# imports the CUDA extension at module scope, so nocuda (which skips building it) doesn't apply here.
+pytestmark = pytest.mark.nogpu
+
 
 @dataclass
 class StubInitialState:
@@ -307,6 +311,8 @@ def test_hrex_implementation_propagates_stop_iteration_from_pre_production_check
     with (
         patch("tmd.fe.rbfe.run_sims_bisection", return_value=bisection_output),
         patch("tmd.fe.rbfe.run_sims_hrex_iter") as run_sims_hrex_iter,
+        patch("tmd.fe.rbfe.pickle.dump"),
+        patch("builtins.open", mock_open()),
         pytest.raises(StopIteration, match="pre-production callback stopped"),
     ):
         estimate_relative_free_energy_bisection_hrex_impl(
@@ -389,6 +395,8 @@ def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume
         patch("tmd.fe.rbfe.run_sims_hrex_iter", side_effect=run_checkpointing_hrex),
         patch("tmd.fe.rbfe.make_pair_bar_plots", return_value=Mock()),
         patch("tmd.fe.rbfe.plot_as_png_fxn", return_value=b"plot"),
+        patch("tmd.fe.rbfe.pickle.dump"),
+        patch("builtins.open", mock_open()),
     ):
         result = estimate_relative_free_energy_bisection_hrex_impl(
             temperature=300.0,
@@ -406,15 +414,20 @@ def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume
 
     run_sims_bisection.assert_not_called()
     assert result.intermediate_results is resume_state.bisection_results
-    assert len(callback_calls) == 1
-    assert not any(call.completed_frames is None for call in callback_calls)
+    assert [call.completed_frames for call in callback_calls] == [3]
+    assert callback_calls[0].initial_states_hrex is resume_state.initial_states_hrex
+    assert callback_calls[0].bisection_results is resume_state.bisection_results
 
 
 def test_hrex_implementation_rejects_production_state_without_a_saved_schedule():
     md_params = make_hrex_md_params()
     resume_state = make_production_checkpoint(2)
 
-    with pytest.raises(ValueError, match="no saved lambda schedule"):
+    with (
+        patch("tmd.fe.rbfe.pickle.dump"),
+        patch("builtins.open", mock_open()),
+        pytest.raises(ValueError, match="no saved lambda schedule"),
+    ):
         estimate_relative_free_energy_bisection_hrex_impl(
             temperature=300.0,
             lambda_min=0.0,
