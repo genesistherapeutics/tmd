@@ -582,10 +582,9 @@ def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
     ] * expected_call_count
 
 
-def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topology):
+def _setup_hif2a_hrex_initial_states(single_topology):
     lambdas = np.linspace(0.0, 0.1, 4)
-    single_topology, _ = hif2a_ligand_pair_single_topology
-    initial_states = setup_initial_states(
+    return setup_initial_states(
         single_topology,
         None,
         DEFAULT_TEMP,
@@ -595,6 +594,11 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
         min_cutoff=None,
         dt=1e-3,
     )
+
+
+def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topology):
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
     initial_states = [
         replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
         for initial_state in initial_states
@@ -692,18 +696,8 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
 
 
 def test_hrex_checkpoint_forced_stop_and_resume_with_batch_simulations(hif2a_ligand_pair_single_topology):
-    lambdas = np.linspace(0.0, 0.1, 4)
     single_topology, _ = hif2a_ligand_pair_single_topology
-    initial_states = setup_initial_states(
-        single_topology,
-        None,
-        DEFAULT_TEMP,
-        lambdas,
-        seed=2026,
-        verify_constraints=False,
-        min_cutoff=None,
-        dt=1e-3,
-    )
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
     initial_states = [
         replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
         for initial_state in initial_states
@@ -755,18 +749,8 @@ def test_hrex_checkpoint_forced_stop_and_resume_with_batch_simulations(hif2a_lig
 
 
 def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair_single_topology):
-    lambdas = np.linspace(0.0, 0.1, 4)
     single_topology, _ = hif2a_ligand_pair_single_topology
-    initial_states = setup_initial_states(
-        single_topology,
-        None,
-        DEFAULT_TEMP,
-        lambdas,
-        seed=2026,
-        verify_constraints=False,
-        min_cutoff=None,
-        dt=1e-3,
-    )
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
 
     checkpoint = HREXCheckpoint(
         completed_frames=None,
@@ -786,18 +770,8 @@ def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair
 
 
 def test_hrex_schedule_only_checkpoint_starts_production_like_fresh_run(hif2a_ligand_pair_single_topology):
-    lambdas = np.linspace(0.0, 0.1, 4)
     single_topology, _ = hif2a_ligand_pair_single_topology
-    initial_states = setup_initial_states(
-        single_topology,
-        None,
-        DEFAULT_TEMP,
-        lambdas,
-        seed=2026,
-        verify_constraints=False,
-        min_cutoff=None,
-        dt=1e-3,
-    )
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
     initial_states = [
         replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
         for initial_state in initial_states

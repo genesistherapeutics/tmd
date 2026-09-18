@@ -199,22 +199,24 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
     hrex_diagnostics = Mock(transition_matrix=Mock(), cumulative_replica_state_counts=Mock())
     final_result = (pair_bar_result, production_trajectories, hrex_diagnostics, None)
 
+    expected_production_checkpoints = []
+
     def run_checkpointing_hrex(initial_states_hrex, *args, **kwargs):
         assert kwargs["resume_state"] is resume_state
         assert kwargs["checkpoint_interval_frames"] == 1
         # The implementation attaches the schedule and bisection report to each yielded checkpoint.
-        expected = [
+        expected_production_checkpoints.extend(
             replace(checkpoint, initial_states_hrex=initial_states_hrex, bisection_results=bisection_output[0])
             for checkpoint in checkpoints
-        ]
+        )
         yield checkpoints[0]
         # callback_calls[0] is the pre-production checkpoint carrying the freshly computed schedule.
         assert callback_calls[0].completed_frames is None
         assert callback_calls[0].initial_states_hrex is initial_states_hrex
         assert callback_calls[0].bisection_results is bisection_output[0]
-        assert callback_calls[1:] == expected[:1]
+        assert callback_calls[1:] == expected_production_checkpoints[:1]
         yield checkpoints[1]
-        assert callback_calls[1:] == expected
+        assert callback_calls[1:] == expected_production_checkpoints
         return final_result
 
     with (
@@ -222,6 +224,8 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
         patch("tmd.fe.rbfe.run_sims_hrex_iter", side_effect=run_checkpointing_hrex),
         patch("tmd.fe.rbfe.make_pair_bar_plots", return_value=Mock()),
         patch("tmd.fe.rbfe.plot_as_png_fxn", return_value=b"plot"),
+        patch("tmd.fe.rbfe.pickle.dump"),
+        patch("builtins.open", mock_open()),
     ):
         result = estimate_relative_free_energy_bisection_hrex_impl(
             temperature=300.0,
@@ -237,7 +241,8 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
             checkpoint_callback=callback_calls.append,
         )
 
-    assert len(callback_calls) == 3
+    assert callback_calls[1:] == expected_production_checkpoints
+    assert callback_calls[0].completed_frames is None
     assert result.final_result is pair_bar_result
     assert result.trajectories is production_trajectories
     assert result.hrex_diagnostics is hrex_diagnostics
@@ -263,6 +268,8 @@ def test_hrex_implementation_fires_checkpoint_callback_once_after_bisection_on_f
         patch("tmd.fe.rbfe.run_sims_hrex_iter", side_effect=run_checkpointing_hrex),
         patch("tmd.fe.rbfe.make_pair_bar_plots", return_value=Mock()),
         patch("tmd.fe.rbfe.plot_as_png_fxn", return_value=b"plot"),
+        patch("tmd.fe.rbfe.pickle.dump"),
+        patch("builtins.open", mock_open()),
     ):
         estimate_relative_free_energy_bisection_hrex_impl(
             temperature=300.0,
