@@ -186,6 +186,7 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
     resume_state.initial_states_hrex = None
+    resume_state.completed_frames = None
     checkpoints = [make_production_checkpoint(completed_frames) for completed_frames in (1, 2)]
     callback_calls = []
     bisection_output = make_stub_bisection_output()
@@ -288,6 +289,34 @@ def test_hrex_implementation_fires_checkpoint_callback_once_after_bisection_on_f
     assert [call.completed_frames for call in callback_calls[1:]] == [1, 2]
 
 
+def test_hrex_implementation_propagates_stop_iteration_from_pre_production_checkpoint_callback():
+    md_params = make_hrex_md_params()
+    bisection_output = make_stub_bisection_output()
+    checkpoint_callback = Mock(side_effect=StopIteration("pre-production callback stopped"))
+
+    with (
+        patch("tmd.fe.rbfe.run_sims_bisection", return_value=bisection_output),
+        patch("tmd.fe.rbfe.run_sims_hrex_iter") as run_sims_hrex_iter,
+        pytest.raises(StopIteration, match="pre-production callback stopped"),
+    ):
+        estimate_relative_free_energy_bisection_hrex_impl(
+            temperature=300.0,
+            lambda_min=0.0,
+            lambda_max=1.0,
+            md_params=md_params,
+            n_windows=2,
+            make_initial_state_fn=Mock(),
+            optimize_initial_state_fn=Mock(),
+            combined_prefix="checkpoint",
+            resume_state=None,
+            checkpoint_interval_frames=1,
+            checkpoint_callback=checkpoint_callback,
+        )
+
+    checkpoint_callback.assert_called_once()
+    run_sims_hrex_iter.assert_not_called()
+
+
 def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback():
     md_params = make_hrex_md_params()
     # A resume state with a locked schedule skips bisection, so the only checkpoint callback call is the
@@ -385,3 +414,23 @@ def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume
     assert result.intermediate_results is resume_state.bisection_results
     assert len(callback_calls) == 1
     assert not any(call.completed_frames is None for call in callback_calls)
+
+
+def test_hrex_implementation_rejects_production_state_without_a_saved_schedule():
+    md_params = make_hrex_md_params()
+    resume_state = make_production_checkpoint(2)
+
+    with pytest.raises(ValueError, match="no saved lambda schedule"):
+        estimate_relative_free_energy_bisection_hrex_impl(
+            temperature=300.0,
+            lambda_min=0.0,
+            lambda_max=1.0,
+            md_params=md_params,
+            n_windows=2,
+            make_initial_state_fn=Mock(),
+            optimize_initial_state_fn=Mock(),
+            combined_prefix="checkpoint",
+            resume_state=resume_state,
+            checkpoint_interval_frames=1,
+            checkpoint_callback=Mock(),
+        )

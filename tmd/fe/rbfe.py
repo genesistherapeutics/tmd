@@ -768,15 +768,18 @@ def estimate_relative_free_energy_bisection_or_hrex(
     Parameters
     ----------
     resume_state: HREXCheckpoint or None
-        Checkpoint containing the completed HREX production prefix to resume. Returned trajectories contain only the
-        post-resume suffix.
+        Checkpoint to resume from. See :py:func:`estimate_relative_free_energy_bisection_hrex_impl` for how a
+        saved lambda schedule and production state are each handled on resume.
 
     checkpoint_interval_frames: int or None
-        Generate a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
-        does not force a checkpoint. None disables checkpoint generation.
+        Generate a production checkpoint whenever the absolute completed-frame count is a positive multiple of
+        N. The final frame does not force a checkpoint. None disables per-interval production checkpoints, but
+        does not suppress the one-time checkpoint fired right after the trial phase when checkpoint_callback is
+        set.
 
     checkpoint_callback: callable(HREXCheckpoint) or None
-        Called synchronously for each generated checkpoint.
+        Called synchronously for each generated checkpoint: once right after the trial phase completes (with
+        production fields empty), and then once per checkpoint_interval_frames during production.
 
     """
     hrex_params = kwargs["md_params"].hrex_params
@@ -986,15 +989,21 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         value. When given, the final number of windows may be less than or equal to n_windows.
 
     resume_state: HREXCheckpoint or None
-        Checkpoint containing the completed production prefix to resume. Returned trajectories contain only the
-        post-resume suffix.
+        Checkpoint to resume from. If it carries a saved lambda schedule (initial_states_hrex), the trial
+        (bisection) phase is skipped and that schedule and its diagnostic report are reused instead of
+        recomputed. If it also carries production state (completed_frames set), production resumes from the
+        saved frame count and replica state and returned trajectories contain only the post-resume suffix;
+        otherwise production starts at frame 0 on the reused schedule.
 
     checkpoint_interval_frames: int or None
-        Generate a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
-        does not force a checkpoint. None disables checkpoint generation.
+        Generate a production checkpoint whenever the absolute completed-frame count is a positive multiple of
+        N. The final frame does not force a checkpoint. None disables per-interval production checkpoints, but
+        does not suppress the one-time checkpoint fired right after the trial phase when checkpoint_callback is
+        set (see checkpoint_callback).
 
     checkpoint_callback: callable(HREXCheckpoint) or None
-        Called synchronously for each generated checkpoint.
+        Called synchronously for each generated checkpoint: once right after the trial phase completes (with
+        production fields empty), and then once per checkpoint_interval_frames during production.
 
     Returns
     -------
@@ -1028,6 +1037,21 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             assert batch_size > 1
 
     try:
+        if (
+            resume_state is not None
+            and resume_state.completed_frames is not None
+            and resume_state.initial_states_hrex is None
+        ):
+            # Production state without a saved schedule is not a state this code's own checkpoint-writing path
+            # can produce (every checkpoint taken after the trial phase carries the schedule); it's only
+            # reachable from a checkpoint written before schedule persistence existed. Recomputing a schedule
+            # here and splicing this resume_state's production state onto it is exactly the silent-corruption
+            # risk this feature exists to eliminate, so refuse rather than guess.
+            raise ValueError(
+                "resume_state has production state (completed_frames is set) but no saved lambda schedule "
+                "(initial_states_hrex is None); this checkpoint predates schedule persistence and cannot be "
+                "safely resumed"
+            )
         if resume_state is not None and resume_state.initial_states_hrex is not None:
             # The lambda schedule and bisection report were computed by a previous attempt; reuse them.
             initial_states_hrex = resume_state.initial_states_hrex
@@ -1268,15 +1292,21 @@ def estimate_relative_free_energy_bisection_hrex(
         Temperature (Kelvin) to run simulation at, defaults to tmd.constants.DEFAULT_TEMP
 
     resume_state: HREXCheckpoint or None
-        Checkpoint containing the completed production prefix to resume. Returned trajectories contain only the
-        post-resume suffix.
+        Checkpoint to resume from. If it carries a saved lambda schedule (initial_states_hrex), the trial
+        (bisection) phase is skipped and that schedule and its diagnostic report are reused instead of
+        recomputed. If it also carries production state (completed_frames set), production resumes from the
+        saved frame count and replica state and returned trajectories contain only the post-resume suffix;
+        otherwise production starts at frame 0 on the reused schedule.
 
     checkpoint_interval_frames: int or None
-        Generate a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
-        does not force a checkpoint. None disables checkpoint generation.
+        Generate a production checkpoint whenever the absolute completed-frame count is a positive multiple of
+        N. The final frame does not force a checkpoint. None disables per-interval production checkpoints, but
+        does not suppress the one-time checkpoint fired right after the trial phase when checkpoint_callback is
+        set (see checkpoint_callback).
 
     checkpoint_callback: callable(HREXCheckpoint) or None
-        Called synchronously for each generated checkpoint.
+        Called synchronously for each generated checkpoint: once right after the trial phase completes (with
+        production fields empty), and then once per checkpoint_interval_frames during production.
 
     Returns
     -------

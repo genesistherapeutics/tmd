@@ -2370,7 +2370,9 @@ def run_sims_hrex_iter(
         Run simulations in batch mode. May result in GPU running out of memory
 
     resume_state: HREXCheckpoint or None
-        Checkpoint containing the completed production prefix to resume
+        Checkpoint containing the completed production prefix to resume. If ``completed_frames`` is unset
+        (including a schedule-only checkpoint with no production state yet), production starts at frame 0, the
+        same as if ``resume_state`` were None.
 
     checkpoint_interval_frames: int or None
         Yield a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
@@ -2443,6 +2445,7 @@ def run_sims_hrex_iter(
     else:
         completed_frames = resume_state.completed_frames
         assert resume_state.hrex is not None
+        assert resume_state.iterated_u_kln is not None
         hrex = resume_state.hrex
         iterated_u_kln[..., :completed_frames] = resume_state.iterated_u_kln
         replica_idx_by_state_by_iter = [list(permutation) for permutation in resume_state.replica_idx_by_state_by_iter]
