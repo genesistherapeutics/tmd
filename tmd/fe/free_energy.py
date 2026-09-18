@@ -2203,7 +2203,7 @@ def generate_pair_bar_ulkns(
 def _compute_hrex_mover_steps(
     md_params: MDParams, current_iteration: int, include_equilibration_water_step: bool
 ) -> tuple[int, int]:
-    """Compute barostat and water-sampler phases for an HREX iteration."""
+    # Movers are not called during local steps, so if local moves are mixed in need to account only for global steps
     local_steps = md_params.local_md_params.local_steps if md_params.local_md_params is not None else 0
     production_global_steps = md_params.steps_per_frame - local_steps
     barostat_step = current_iteration * production_global_steps

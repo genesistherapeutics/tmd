@@ -1061,7 +1061,6 @@ def estimate_relative_free_energy_bisection_hrex_impl(
                 "safely resumed"
             )
         if resume_state is not None and resume_state.initial_states_hrex is not None:
-            # The lambda schedule and bisection report were computed by a previous attempt; reuse them.
             initial_states_hrex = resume_state.initial_states_hrex
             assert resume_state.bisection_results is not None
             results = resume_state.bisection_results
@@ -1148,7 +1147,6 @@ def estimate_relative_free_energy_bisection_hrex_impl(
                         else None
                     ),
                 )
-                # Verify that the forces of the system are reasonable
                 return updated_state
 
             t0 = time.perf_counter()

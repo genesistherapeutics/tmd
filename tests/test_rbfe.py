@@ -288,8 +288,7 @@ def test_hrex_implementation_fires_checkpoint_callback_once_after_bisection_on_f
     assert first_call.water_sampler_proposals_by_state_by_iter == []
     assert [s.lamb for s in first_call.initial_states_hrex] == [0.0, 1.0]
     assert first_call.bisection_results is bisection_output[0]
-    # The remaining calls are the per-interval production checkpoints yielded by run_sims_hrex_iter, each
-    # with completed_frames set — confirming the schedule-only checkpoint fired strictly before production.
+    # The schedule-only checkpoint fired strictly before either production checkpoint.
     assert [call.completed_frames for call in callback_calls[1:]] == [1, 2]
 
 
