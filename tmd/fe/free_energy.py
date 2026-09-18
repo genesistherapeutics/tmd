@@ -2442,6 +2442,7 @@ def run_sims_hrex_iter(
         fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]] = []
     else:
         completed_frames = resume_state.completed_frames
+        assert resume_state.hrex is not None
         hrex = resume_state.hrex
         iterated_u_kln[..., :completed_frames] = resume_state.iterated_u_kln
         replica_idx_by_state_by_iter = [list(permutation) for permutation in resume_state.replica_idx_by_state_by_iter]
