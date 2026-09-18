@@ -238,6 +238,55 @@ def test_hrex_implementation_invokes_checkpoint_callback_synchronously_and_resum
     assert result.hrex_diagnostics is hrex_diagnostics
 
 
+def test_hrex_implementation_fires_checkpoint_callback_once_after_bisection_on_fresh_run():
+    md_params = make_hrex_md_params()
+    checkpoints = [make_production_checkpoint(completed_frames) for completed_frames in (1, 2)]
+    callback_calls = []
+    bisection_output = make_stub_bisection_output()
+    pair_bar_result = Mock()
+    production_trajectories = [Mock(), Mock()]
+    hrex_diagnostics = Mock(transition_matrix=Mock(), cumulative_replica_state_counts=Mock())
+    final_result = (pair_bar_result, production_trajectories, hrex_diagnostics, None)
+
+    def run_checkpointing_hrex(initial_states_hrex, *args, **kwargs):
+        yield checkpoints[0]
+        yield checkpoints[1]
+        return final_result
+
+    with (
+        patch("tmd.fe.rbfe.run_sims_bisection", return_value=bisection_output),
+        patch("tmd.fe.rbfe.run_sims_hrex_iter", side_effect=run_checkpointing_hrex),
+        patch("tmd.fe.rbfe.make_pair_bar_plots", return_value=Mock()),
+        patch("tmd.fe.rbfe.plot_as_png_fxn", return_value=b"plot"),
+    ):
+        estimate_relative_free_energy_bisection_hrex_impl(
+            temperature=300.0,
+            lambda_min=0.0,
+            lambda_max=1.0,
+            md_params=md_params,
+            n_windows=2,
+            make_initial_state_fn=Mock(),
+            optimize_initial_state_fn=Mock(),
+            combined_prefix="checkpoint",
+            resume_state=None,
+            checkpoint_interval_frames=1,
+            checkpoint_callback=callback_calls.append,
+        )
+
+    assert len(callback_calls) == 3
+    first_call = callback_calls[0]
+    assert first_call.completed_frames is None
+    assert first_call.hrex is None
+    assert first_call.iterated_u_kln is None
+    assert first_call.replica_idx_by_state_by_iter == []
+    assert first_call.fraction_accepted_by_pair_by_iter == []
+    assert first_call.water_sampler_proposals_by_state_by_iter == []
+    assert [s.lamb for s in first_call.initial_states_hrex] == [0.0, 1.0]
+    # The remaining calls are the per-interval production checkpoints yielded by run_sims_hrex_iter, each
+    # with completed_frames set — confirming the schedule-only checkpoint fired strictly before production.
+    assert [call.completed_frames for call in callback_calls[1:]] == [1, 2]
+
+
 def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback():
     md_params = make_hrex_md_params()
     # A resume state with a locked schedule skips bisection, so the only checkpoint callback call is the
