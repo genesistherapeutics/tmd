@@ -275,3 +275,62 @@ def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback(
         )
 
     checkpoint_callback.assert_called_once_with(checkpoint)
+
+
+def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume():
+    md_params = make_hrex_md_params()
+    resume_state = HREXCheckpoint(
+        completed_frames=2,
+        hrex=Mock(),
+        iterated_u_kln=Mock(),
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=[StubInitialState(0.3)],
+        bisection_results=["sentinel-report"],
+    )
+    callback_calls = []
+    pair_bar_result = Mock()
+    production_trajectories = [Mock(), Mock()]
+    hrex_diagnostics = Mock(transition_matrix=Mock(), cumulative_replica_state_counts=Mock())
+    final_result = (pair_bar_result, production_trajectories, hrex_diagnostics, None)
+
+    def run_checkpointing_hrex(initial_states_hrex, *args, **kwargs):
+        # The implementation must pass the resumed checkpoint's own saved schedule through unchanged, not a
+        # freshly computed one.
+        assert initial_states_hrex is resume_state.initial_states_hrex
+        yield HREXCheckpoint(
+            completed_frames=3,
+            hrex=Mock(),
+            iterated_u_kln=Mock(),
+            replica_idx_by_state_by_iter=[],
+            fraction_accepted_by_pair_by_iter=[],
+            water_sampler_proposals_by_state_by_iter=[],
+            initial_states_hrex=None,
+            bisection_results=None,
+        )
+        return final_result
+
+    with (
+        patch("tmd.fe.rbfe.run_sims_bisection") as run_sims_bisection,
+        patch("tmd.fe.rbfe.run_sims_hrex_iter", side_effect=run_checkpointing_hrex),
+        patch("tmd.fe.rbfe.make_pair_bar_plots", return_value=Mock()),
+        patch("tmd.fe.rbfe.plot_as_png_fxn", return_value=b"plot"),
+    ):
+        result = estimate_relative_free_energy_bisection_hrex_impl(
+            temperature=300.0,
+            lambda_min=0.0,
+            lambda_max=1.0,
+            md_params=md_params,
+            n_windows=2,
+            make_initial_state_fn=Mock(),
+            optimize_initial_state_fn=Mock(),
+            combined_prefix="checkpoint",
+            resume_state=resume_state,
+            checkpoint_interval_frames=1,
+            checkpoint_callback=callback_calls.append,
+        )
+
+    run_sims_bisection.assert_not_called()
+    assert result.intermediate_results is resume_state.bisection_results
+    assert not any(call.completed_frames is None for call in callback_calls)
