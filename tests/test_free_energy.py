@@ -1618,3 +1618,217 @@ def test_initial_state_to_bound_impl():
     du_dx, u = bound_impl.execute(x, box, compute_du_dx=True, compute_u=True)
     assert np.isfinite(u)
     assert np.isfinite(du_dx).all()
+
+
+def _make_valid_hrex_checkpoint(n_states=2, n_potentials=1, n_atoms=3, completed_frames=2, iterations_per_frame=2):
+    n_iterations = completed_frames * iterations_per_frame
+    replicas = [CoordsVelBox(np.zeros((n_atoms, 3)), np.zeros((n_atoms, 3)), np.eye(3)) for _ in range(n_states)]
+    permutation = list(range(n_states))
+    return HREXCheckpoint(
+        completed_frames=completed_frames,
+        hrex=HREX.from_replicas(replicas),
+        iterated_u_kln=np.zeros((n_potentials, n_states, n_states, completed_frames)),
+        replica_idx_by_state_by_iter=[list(permutation) for _ in range(n_iterations)],
+        fraction_accepted_by_pair_by_iter=[[(0, 1)] * (n_states - 1) for _ in range(n_iterations)],
+        water_sampler_proposals_by_state_by_iter=[[(0, 1)] * n_states for _ in range(n_iterations)],
+        initial_states_hrex=[Mock()] * n_states,
+        bisection_results=[Mock()],
+    )
+
+
+def _validate_kwargs(n_states=2, n_potentials=1, n_atoms=3, n_frames=2, iterations_per_frame=2):
+    return dict(
+        n_states=n_states,
+        n_potentials=n_potentials,
+        n_atoms=n_atoms,
+        md_params=replace(
+            DEFAULT_HREX_PARAMS,
+            n_frames=n_frames,
+            hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=iterations_per_frame),
+        ),
+    )
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_accepts_a_valid_mid_production_checkpoint():
+    _make_valid_hrex_checkpoint().validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_accepts_a_valid_schedule_only_checkpoint():
+    checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=[Mock(), Mock()],
+        bisection_results=[Mock()],
+    )
+    checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_accepts_a_checkpoint_with_nothing_started():
+    checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+    )
+    checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_unsupported_version():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), version=_make_valid_hrex_checkpoint().version + 1)
+    with pytest.raises(ValueError, match="Unsupported HREX checkpoint version"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_requires_hrex_params():
+    checkpoint = _make_valid_hrex_checkpoint()
+    kwargs = _validate_kwargs()
+    kwargs["md_params"] = replace(kwargs["md_params"], hrex_params=None)
+    with pytest.raises(ValueError, match="requires HREX parameters"):
+        checkpoint.validate(**kwargs)
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_schedule_without_bisection_report():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), bisection_results=None)
+    with pytest.raises(ValueError, match="lambda schedule without a bisection report"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_bisection_report_without_schedule():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), initial_states_hrex=None)
+    with pytest.raises(ValueError, match="lambda schedule without a bisection report"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_production_state_without_completed_frames():
+    valid = _make_valid_hrex_checkpoint()
+    checkpoint = replace(valid, completed_frames=None, initial_states_hrex=None, bisection_results=None)
+    with pytest.raises(ValueError, match="no completed_frames but carries production state"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_completed_frames_out_of_range():
+    checkpoint = replace(_make_valid_hrex_checkpoint(completed_frames=2), completed_frames=3)
+    with pytest.raises(ValueError, match="completed_frames must be between 0"):
+        checkpoint.validate(**_validate_kwargs(n_frames=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_missing_hrex_with_completed_frames():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), hrex=None)
+    with pytest.raises(ValueError, match="completed_frames set but no replica state"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_count():
+    checkpoint = _make_valid_hrex_checkpoint(n_states=2)
+    with pytest.raises(ValueError, match="has 2 replicas, expected 3"):
+        checkpoint.validate(**_validate_kwargs(n_states=3))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_coordinate_shape():
+    valid = _make_valid_hrex_checkpoint(n_states=2, n_atoms=3)
+    bad_replica = valid.hrex.replicas[0]._replace(coords=np.zeros((4, 3)))
+    checkpoint = replace(valid, hrex=HREX.from_replicas([bad_replica, valid.hrex.replicas[1]]))
+    with pytest.raises(ValueError, match="coordinate and velocity shapes have invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs(n_atoms=3))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_box_shape():
+    valid = _make_valid_hrex_checkpoint(n_states=2, n_atoms=3)
+    bad_replica = valid.hrex.replicas[0]._replace(box=np.zeros((2, 2)))
+    checkpoint = replace(valid, hrex=HREX.from_replicas([bad_replica, valid.hrex.replicas[1]]))
+    with pytest.raises(ValueError, match="box has invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_permutation():
+    valid = _make_valid_hrex_checkpoint(n_states=2)
+    checkpoint = replace(valid, hrex=replace(valid.hrex, replica_idx_by_state=[ReplicaIdx(0), ReplicaIdx(0)]))
+    with pytest.raises(ValueError, match="current replica permutation is invalid"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_missing_iterated_u_kln():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), iterated_u_kln=None)
+    with pytest.raises(ValueError, match="completed_frames set but no iterated_u_kln"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_iterated_u_kln_shape():
+    checkpoint = replace(_make_valid_hrex_checkpoint(n_potentials=1), iterated_u_kln=np.zeros((2, 2, 2, 2)))
+    with pytest.raises(ValueError, match="iterated_u_kln has shape"):
+        checkpoint.validate(**_validate_kwargs(n_potentials=1))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_permutation_history_length():
+    valid = _make_valid_hrex_checkpoint(completed_frames=2, iterations_per_frame=2)
+    checkpoint = replace(valid, replica_idx_by_state_by_iter=valid.replica_idx_by_state_by_iter[:-1])
+    with pytest.raises(ValueError, match="replica permutation history must contain one valid permutation"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_replica_permutation_history_entry():
+    valid = _make_valid_hrex_checkpoint(n_states=2, completed_frames=2, iterations_per_frame=2)
+    bad_history = [[0, 0]] + valid.replica_idx_by_state_by_iter[1:]
+    checkpoint = replace(valid, replica_idx_by_state_by_iter=bad_history)
+    with pytest.raises(ValueError, match="replica permutation history must contain one valid permutation"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_swap_count_history_length():
+    valid = _make_valid_hrex_checkpoint(completed_frames=2, iterations_per_frame=2)
+    checkpoint = replace(valid, fraction_accepted_by_pair_by_iter=valid.fraction_accepted_by_pair_by_iter[:-1])
+    with pytest.raises(ValueError, match="swap-count history has invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_swap_counts():
+    valid = _make_valid_hrex_checkpoint(n_states=2, completed_frames=2, iterations_per_frame=2)
+    bad_history = [[(2, 1)]] + valid.fraction_accepted_by_pair_by_iter[1:]
+    checkpoint = replace(valid, fraction_accepted_by_pair_by_iter=bad_history)
+    with pytest.raises(ValueError, match="swap-count history contains invalid acceptance/proposal counts"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_water_proposal_history_length():
+    valid = _make_valid_hrex_checkpoint(completed_frames=2, iterations_per_frame=2)
+    checkpoint = replace(
+        valid, water_sampler_proposals_by_state_by_iter=valid.water_sampler_proposals_by_state_by_iter[:-1]
+    )
+    with pytest.raises(ValueError, match="water-proposal history has invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_water_proposal_counts():
+    valid = _make_valid_hrex_checkpoint(n_states=2, completed_frames=2, iterations_per_frame=2)
+    bad_history = [[(2, 1), (0, 1)]] + valid.water_sampler_proposals_by_state_by_iter[1:]
+    checkpoint = replace(valid, water_sampler_proposals_by_state_by_iter=bad_history)
+    with pytest.raises(ValueError, match="water-proposal history contains invalid acceptance/proposal counts"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
