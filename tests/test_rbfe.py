@@ -78,7 +78,6 @@ def test_bisection_dispatch_preserves_call_without_checkpoint_arguments():
 def test_hrex_dispatch_forwards_checkpoint_arguments():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
-    resume_state.initial_states_hrex = None
     checkpoint_callback = Mock()
     expected_result = Mock()
 
@@ -106,7 +105,6 @@ def test_hrex_dispatch_forwards_checkpoint_arguments():
 def test_hrex_entry_point_forwards_checkpoint_arguments_to_implementation():
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
-    resume_state.initial_states_hrex = None
     checkpoint_callback = Mock()
     expected_result = Mock()
     initial_states = [Mock(), Mock()]
@@ -143,7 +141,6 @@ def test_hrex_entry_point_forwards_checkpoint_arguments_to_implementation():
 def test_rbfe_leg_forwards_checkpoint_arguments(leg_name):
     md_params = make_hrex_md_params()
     resume_state = Mock(spec=HREXCheckpoint)
-    resume_state.initial_states_hrex = None
     checkpoint_callback = Mock()
     forcefield = SimpleNamespace(water_ff=Mock(), protein_ff=Mock())
     mol_a = Mock()
@@ -358,15 +355,8 @@ def test_hrex_implementation_propagates_stop_iteration_from_checkpoint_callback(
 
 def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume():
     md_params = make_hrex_md_params()
-    resume_state = HREXCheckpoint(
-        completed_frames=2,
-        hrex=Mock(),
-        iterated_u_kln=Mock(),
-        replica_idx_by_state_by_iter=[],
-        fraction_accepted_by_pair_by_iter=[],
-        water_sampler_proposals_by_state_by_iter=[],
-        initial_states_hrex=[StubInitialState(0.3)],
-        bisection_results=["sentinel-report"],
+    resume_state = make_production_checkpoint(
+        2, initial_states_hrex=[StubInitialState(0.3)], bisection_results=["sentinel-report"]
     )
     callback_calls = []
     pair_bar_result = Mock()
@@ -378,16 +368,7 @@ def test_hrex_implementation_skips_bisection_and_reuses_saved_schedule_on_resume
         # The implementation must pass the resumed checkpoint's own saved schedule through unchanged, not a
         # freshly computed one.
         assert initial_states_hrex is resume_state.initial_states_hrex
-        yield HREXCheckpoint(
-            completed_frames=3,
-            hrex=Mock(),
-            iterated_u_kln=Mock(),
-            replica_idx_by_state_by_iter=[],
-            fraction_accepted_by_pair_by_iter=[],
-            water_sampler_proposals_by_state_by_iter=[],
-            initial_states_hrex=None,
-            bisection_results=None,
-        )
+        yield make_production_checkpoint(3)
         return final_result
 
     with (

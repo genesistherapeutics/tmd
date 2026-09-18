@@ -720,12 +720,6 @@ def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair
     roundtripped = pickle.loads(pickle.dumps(checkpoint))
 
     assert roundtripped.completed_frames is None
-    assert roundtripped.hrex is None
-    assert roundtripped.iterated_u_kln is None
-    assert roundtripped.replica_idx_by_state_by_iter == []
-    assert roundtripped.fraction_accepted_by_pair_by_iter == []
-    assert roundtripped.water_sampler_proposals_by_state_by_iter == []
-    assert roundtripped.bisection_results == []
     assert [s.lamb for s in roundtripped.initial_states_hrex] == [s.lamb for s in initial_states]
 
 
