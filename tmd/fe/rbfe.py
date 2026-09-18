@@ -37,6 +37,7 @@ from tmd.fe.free_energy import (
     HREXSimulationResult,
     InitialState,
     MDParams,
+    PairBarResult,
     RESTParams,
     SimulationResult,
     Trajectory,
@@ -1044,6 +1045,111 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             batch_size = int(batch_flag)
             assert batch_size > 1
 
+    def run_bisection_phase() -> tuple[Sequence[InitialState], list[PairBarResult]]:
+        assert md_params.hrex_params is not None  # narrowed at call time; mypy can't see across the closure
+
+        # First phase: bisection to determine lambda spacing
+        md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
+
+        # Always optimize during bisection
+        make_optimized_initial_state_fn = lambda lamb: optimize_initial_state_fn(make_initial_state_fn(lamb))
+
+        t0 = time.perf_counter()
+        results, trajectories_by_state = run_sims_bisection(
+            [lambda_min, lambda_max],
+            make_optimized_initial_state_fn,
+            md_params_bisection,
+            n_bisections=n_windows - 2,
+            temperature=temperature,
+            min_overlap=min_overlap,
+            batch_size=batch_size if batch_simulations else 1,
+        )
+        print(f"[TIMER] bisection {time.perf_counter() - t0:.2f}s", flush=True)
+
+        assert all(traj.final_velocities is not None for traj in trajectories_by_state)
+
+        initial_states = results[-1].initial_states
+        has_barostat_by_state = [initial_state.barostat is not None for initial_state in initial_states]
+        assert all(has_barostat_by_state) or not any(has_barostat_by_state)
+
+        def get_mean_final_barostat_volume_scale_factor(
+            trajectories_by_state: Iterable[Trajectory],
+        ) -> Optional[float]:
+            scale_factors = [traj.final_barostat_volume_scale_factor for traj in trajectories_by_state]
+            if any(x is not None for x in scale_factors):
+                assert all(x is not None for x in scale_factors)
+                sfs = cast(list[float], scale_factors)  # implied by assertion but required by mypy
+                return float(np.mean(sfs))
+            else:
+                return None
+
+        mean_final_barostat_volume_scale_factor = get_mean_final_barostat_volume_scale_factor(trajectories_by_state)
+        assert (mean_final_barostat_volume_scale_factor is not None) == all(has_barostat_by_state)
+
+        summed_pot = None
+
+        def get_initial_state(lamb: float) -> InitialState:
+            nonlocal summed_pot
+            state_idx = get_nearest_state_idx(lamb, initial_states)
+            nearest_state = initial_states[state_idx]
+            traj = trajectories_by_state[state_idx]
+            if np.isclose(nearest_state.lamb, lamb):
+                state = nearest_state
+            else:
+                # If the lambda value is different, reconstruct the initial state to the correct parameters
+                state = make_initial_state_fn(lamb)
+
+                # Setup a single summed pot for checking forces
+                if summed_pot is None:
+                    summed_pot = state.to_bound_impl().get_potential()
+
+                # Verify that the forces of the nearest lambda value's frames are stable, since frames were not generated
+                # with the same parameters
+                du_dx, _, _ = summed_pot.execute(
+                    traj.frames[-1],
+                    np.concatenate([np.asarray(bp.params).reshape(-1) for bp in state.potentials]),
+                    traj.boxes[-1],
+                    compute_u=False,
+                    compute_du_dp=False,
+                )
+                minimizer.check_force_norm(-du_dx)
+            # Use equilibrated samples and the average of the final barostat volume scale factors from bisection phase to
+            # initialize states for HREX
+            updated_state = replace(
+                state,
+                x0=traj.frames[-1],
+                v0=traj.final_velocities,  # type: ignore
+                box0=traj.boxes[-1],
+                barostat=(
+                    replace(
+                        state.barostat,
+                        adaptive_scaling_enabled=False,
+                        initial_volume_scale_factor=mean_final_barostat_volume_scale_factor,
+                    )
+                    if state.barostat
+                    else None
+                ),
+            )
+            return updated_state
+
+        t0 = time.perf_counter()
+        if md_params.hrex_params.optimize_target_overlap is not None:
+            initial_states_hrex = rebalance_lambda_schedule(
+                initial_states,
+                get_initial_state,
+                trajectories_by_state,
+                md_params.hrex_params.optimize_target_overlap,
+                max_windows=n_windows,
+            )
+        else:
+            initial_states_hrex = [get_initial_state(s.lamb) for s in initial_states]
+        print(f"[TIMER] lambda_rebalance {time.perf_counter() - t0:.2f}s", flush=True)
+
+        # Delete the summed potential to reduce GPU memory usage
+        del summed_pot
+
+        return initial_states_hrex, results
+
     try:
         if (
             resume_state is not None
@@ -1064,120 +1170,28 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             initial_states_hrex = resume_state.initial_states_hrex
             assert resume_state.bisection_results is not None
             results = resume_state.bisection_results
+            freshly_computed_schedule = False
         else:
-            # First phase: bisection to determine lambda spacing
-            md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
+            initial_states_hrex, results = run_bisection_phase()
+            freshly_computed_schedule = True
 
-            # Always optimize during bisection
-            make_optimized_initial_state_fn = lambda lamb: optimize_initial_state_fn(make_initial_state_fn(lamb))
-
-            t0 = time.perf_counter()
-            results, trajectories_by_state = run_sims_bisection(
-                [lambda_min, lambda_max],
-                make_optimized_initial_state_fn,
-                md_params_bisection,
-                n_bisections=n_windows - 2,
-                temperature=temperature,
-                min_overlap=min_overlap,
-                batch_size=batch_size if batch_simulations else 1,
-            )
-            print(f"[TIMER] bisection {time.perf_counter() - t0:.2f}s", flush=True)
-
-            assert all(traj.final_velocities is not None for traj in trajectories_by_state)
-
-            initial_states = results[-1].initial_states
-            has_barostat_by_state = [initial_state.barostat is not None for initial_state in initial_states]
-            assert all(has_barostat_by_state) or not any(has_barostat_by_state)
-
-            def get_mean_final_barostat_volume_scale_factor(
-                trajectories_by_state: Iterable[Trajectory],
-            ) -> Optional[float]:
-                scale_factors = [traj.final_barostat_volume_scale_factor for traj in trajectories_by_state]
-                if any(x is not None for x in scale_factors):
-                    assert all(x is not None for x in scale_factors)
-                    sfs = cast(list[float], scale_factors)  # implied by assertion but required by mypy
-                    return float(np.mean(sfs))
-                else:
-                    return None
-
-            mean_final_barostat_volume_scale_factor = get_mean_final_barostat_volume_scale_factor(trajectories_by_state)
-            assert (mean_final_barostat_volume_scale_factor is not None) == all(has_barostat_by_state)
-
-            summed_pot = None
-
-            def get_initial_state(lamb: float) -> InitialState:
-                nonlocal summed_pot
-                state_idx = get_nearest_state_idx(lamb, initial_states)
-                nearest_state = initial_states[state_idx]
-                traj = trajectories_by_state[state_idx]
-                if np.isclose(nearest_state.lamb, lamb):
-                    state = nearest_state
-                else:
-                    # If the lambda value is different, reconstruct the initial state to the correct parameters
-                    state = make_initial_state_fn(lamb)
-
-                    # Setup a single summed pot for checking forces
-                    if summed_pot is None:
-                        summed_pot = state.to_bound_impl().get_potential()
-
-                    # Verify that the forces of the nearest lambda value's frames are stable, since frames were not generated
-                    # with the same parameters
-                    du_dx, _, _ = summed_pot.execute(
-                        traj.frames[-1],
-                        np.concatenate([np.asarray(bp.params).reshape(-1) for bp in state.potentials]),
-                        traj.boxes[-1],
-                        compute_u=False,
-                        compute_du_dp=False,
-                    )
-                    minimizer.check_force_norm(-du_dx)
-                # Use equilibrated samples and the average of the final barostat volume scale factors from bisection phase to
-                # initialize states for HREX
-                updated_state = replace(
-                    state,
-                    x0=traj.frames[-1],
-                    v0=traj.final_velocities,  # type: ignore
-                    box0=traj.boxes[-1],
-                    barostat=(
-                        replace(
-                            state.barostat,
-                            adaptive_scaling_enabled=False,
-                            initial_volume_scale_factor=mean_final_barostat_volume_scale_factor,
-                        )
-                        if state.barostat
-                        else None
-                    ),
-                )
-                return updated_state
-
-            t0 = time.perf_counter()
-            if md_params.hrex_params.optimize_target_overlap is not None:
-                initial_states_hrex = rebalance_lambda_schedule(
-                    initial_states,
-                    get_initial_state,
-                    trajectories_by_state,
-                    md_params.hrex_params.optimize_target_overlap,
-                    max_windows=n_windows,
-                )
-            else:
-                initial_states_hrex = [get_initial_state(s.lamb) for s in initial_states]
-            print(f"[TIMER] lambda_rebalance {time.perf_counter() - t0:.2f}s", flush=True)
-
-            # Delete the summed potential to reduce GPU memory usage
-            del summed_pot
-
+        def emit_checkpoint(checkpoint: HREXCheckpoint) -> None:
             if checkpoint_callback is not None:
                 checkpoint_callback(
-                    HREXCheckpoint(
-                        completed_frames=None,
-                        hrex=None,
-                        iterated_u_kln=None,
-                        replica_idx_by_state_by_iter=[],
-                        fraction_accepted_by_pair_by_iter=[],
-                        water_sampler_proposals_by_state_by_iter=[],
-                        initial_states_hrex=initial_states_hrex,
-                        bisection_results=results,
-                    )
+                    replace(checkpoint, initial_states_hrex=initial_states_hrex, bisection_results=results)
                 )
+
+        if freshly_computed_schedule:
+            emit_checkpoint(
+                HREXCheckpoint(
+                    completed_frames=None,
+                    hrex=None,
+                    iterated_u_kln=None,
+                    replica_idx_by_state_by_iter=[],
+                    fraction_accepted_by_pair_by_iter=[],
+                    water_sampler_proposals_by_state_by_iter=[],
+                )
+            )
 
         # Second phase: sample initial states determined by bisection using HREX
         t0 = time.perf_counter()
@@ -1194,11 +1208,7 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             except StopIteration as completed:
                 pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = completed.value
                 break
-            if checkpoint_callback is not None:
-                # run_sims_hrex_iter has no visibility into the schedule/report, so attach them here.
-                checkpoint_callback(
-                    replace(checkpoint, initial_states_hrex=initial_states_hrex, bisection_results=results)
-                )
+            emit_checkpoint(checkpoint)
         print(f"[TIMER] production_hrex {time.perf_counter() - t0:.2f}s", flush=True)
 
         t0 = time.perf_counter()
