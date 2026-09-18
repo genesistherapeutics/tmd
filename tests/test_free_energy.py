@@ -729,6 +729,75 @@ def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair
     assert [s.lamb for s in roundtripped.initial_states_hrex] == [s.lamb for s in initial_states]
 
 
+def test_hrex_schedule_only_checkpoint_starts_production_like_fresh_run(hif2a_ligand_pair_single_topology):
+    lambdas = np.linspace(0.0, 0.1, 4)
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = setup_initial_states(
+        single_topology,
+        None,
+        DEFAULT_TEMP,
+        lambdas,
+        seed=2026,
+        verify_constraints=False,
+        min_cutoff=None,
+        dt=1e-3,
+    )
+    initial_states = [
+        replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
+        for initial_state in initial_states
+    ]
+    md_params = replace(
+        DEFAULT_HREX_PARAMS,
+        n_frames=2,
+        hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=2),
+    )
+
+    schedule_only_checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=initial_states,
+        bisection_results=None,
+    )
+
+    def run_to_completion(resume_state):
+        sims = run_sims_hrex_iter(
+            initial_states,
+            md_params,
+            print_diagnostics_interval=None,
+            checkpoint_interval_frames=md_params.n_frames,
+            resume_state=resume_state,
+        )
+        final_checkpoint = next(sims)
+        with pytest.raises(StopIteration) as completed:
+            next(sims)
+        return final_checkpoint, completed.value.value
+
+    fresh_checkpoint, fresh_result = run_to_completion(None)
+    resumed_checkpoint, resumed_result = run_to_completion(schedule_only_checkpoint)
+
+    assert fresh_checkpoint.completed_frames == md_params.n_frames
+    assert resumed_checkpoint.completed_frames == fresh_checkpoint.completed_frames
+    np.testing.assert_equal(resumed_checkpoint.iterated_u_kln, fresh_checkpoint.iterated_u_kln)
+    assert resumed_checkpoint.replica_idx_by_state_by_iter == fresh_checkpoint.replica_idx_by_state_by_iter
+    assert resumed_checkpoint.fraction_accepted_by_pair_by_iter == fresh_checkpoint.fraction_accepted_by_pair_by_iter
+
+    fresh_pair_bar_result, fresh_samples, fresh_hrex_diagnostics, _ = fresh_result
+    resumed_pair_bar_result, resumed_samples, resumed_hrex_diagnostics, _ = resumed_result
+    for fresh_sample, resumed_sample in zip(fresh_samples, resumed_samples):
+        assert len(resumed_sample.frames) == md_params.n_frames
+        np.testing.assert_equal(np.array(resumed_sample.frames), np.array(fresh_sample.frames))
+        np.testing.assert_equal(np.array(resumed_sample.boxes), np.array(fresh_sample.boxes))
+    np.testing.assert_equal(
+        resumed_pair_bar_result.u_kln_by_component_by_lambda,
+        fresh_pair_bar_result.u_kln_by_component_by_lambda,
+    )
+    assert resumed_hrex_diagnostics.replica_idx_by_state_by_iter == fresh_hrex_diagnostics.replica_idx_by_state_by_iter
+
+
 @pytest.mark.parametrize("seed", [2024])
 @pytest.mark.parametrize(
     "host_name",
