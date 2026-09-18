@@ -213,6 +213,22 @@ class MDParams:
             assert self.local_md_params.local_steps <= self.steps_per_frame
 
 
+def _validate_count_history(
+    history: list[list[tuple[int, int]]], n_iterations: int, counts_per_iteration: int, label: str
+) -> None:
+    if len(history) != n_iterations or any(
+        len(counts_by_item) != counts_per_iteration or any(len(counts) != 2 for counts in counts_by_item)
+        for counts_by_item in history
+    ):
+        raise ValueError(f"HREX checkpoint {label} history has invalid dimensions")
+    if any(
+        not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
+        for counts_by_item in history
+        for accepted, proposed in counts_by_item
+    ):
+        raise ValueError(f"HREX checkpoint {label} history contains invalid acceptance/proposal counts")
+
+
 @dataclass(frozen=True)
 class HREXCheckpoint:
     # None means no production frame has run yet — check this field, not hrex/iterated_u_kln, to detect that state
@@ -231,6 +247,8 @@ class HREXCheckpoint:
             raise ValueError(f"Unsupported HREX checkpoint version: {self.version}")
         if md_params.hrex_params is None:
             raise ValueError("HREX checkpoint requires HREX parameters")
+        if (self.initial_states_hrex is None) != (self.bisection_results is None):
+            raise ValueError("HREX checkpoint has a lambda schedule without a bisection report, or vice versa")
 
         if self.completed_frames is None:
             if self.hrex is not None or self.iterated_u_kln is not None:
@@ -277,29 +295,12 @@ class HREXCheckpoint:
                 "HREX checkpoint replica permutation history must contain one valid permutation per completed iteration"
             )
 
-        if len(self.fraction_accepted_by_pair_by_iter) != n_completed_iterations or any(
-            len(counts_by_pair) != n_states - 1 or any(len(counts) != 2 for counts in counts_by_pair)
-            for counts_by_pair in self.fraction_accepted_by_pair_by_iter
-        ):
-            raise ValueError("HREX checkpoint swap-count history has invalid dimensions")
-        if any(
-            not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
-            for counts_by_pair in self.fraction_accepted_by_pair_by_iter
-            for accepted, proposed in counts_by_pair
-        ):
-            raise ValueError("HREX checkpoint swap-count history contains invalid acceptance/proposal counts")
-
-        if len(self.water_sampler_proposals_by_state_by_iter) != n_completed_iterations or any(
-            len(counts_by_state) != n_states or any(len(counts) != 2 for counts in counts_by_state)
-            for counts_by_state in self.water_sampler_proposals_by_state_by_iter
-        ):
-            raise ValueError("HREX checkpoint water-proposal history has invalid dimensions")
-        if any(
-            not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
-            for counts_by_state in self.water_sampler_proposals_by_state_by_iter
-            for accepted, proposed in counts_by_state
-        ):
-            raise ValueError("HREX checkpoint water-proposal history contains invalid acceptance/proposal counts")
+        _validate_count_history(
+            self.fraction_accepted_by_pair_by_iter, n_completed_iterations, n_states - 1, "swap-count"
+        )
+        _validate_count_history(
+            self.water_sampler_proposals_by_state_by_iter, n_completed_iterations, n_states, "water-proposal"
+        )
 
 
 @dataclass
@@ -2200,7 +2201,7 @@ def generate_pair_bar_ulkns(
     return u_kln_by_component_by_lambda
 
 
-def _compute_hrex_mover_steps(md_params: MDParams, current_iteration: int) -> tuple[int, int]:
+def _compute_hrex_mover_step(md_params: MDParams, current_iteration: int) -> int:
     # Movers are not called during local steps, so if local moves are mixed in need to account only for global steps
     local_steps = md_params.local_md_params.local_steps if md_params.local_md_params is not None else 0
     production_global_steps = md_params.steps_per_frame - local_steps
@@ -2213,8 +2214,7 @@ def _compute_hrex_mover_steps(md_params: MDParams, current_iteration: int) -> tu
             equilibration_global_steps = equilibration_batches * production_global_steps
         mover_step += equilibration_global_steps
 
-    # The barostat and water sampler share one step counter: both must see the same phase.
-    return mover_step, mover_step
+    return mover_step
 
 
 def run_sequential_hrex_step(
@@ -2240,7 +2240,8 @@ def run_sequential_hrex_step(
         water_sampler = next(mover for mover in context.get_movers() if isinstance(mover, WATER_SAMPLER_MOVERS))
 
     water_sampling_acceptance_proposal_counts_by_state = [(0, 0) for _ in range(len(hrex.replicas))]
-    barostat_step, water_sampler_step = _compute_hrex_mover_steps(md_params, current_frame)
+    # The barostat and water sampler share one step counter: both must see the same phase.
+    mover_step = _compute_hrex_mover_step(md_params, current_frame)
 
     def sample_replica(xvb: CoordsVelBox, state_idx: StateIdx) -> tuple[NDArray, NDArray, NDArray, Optional[float]]:
         context.set_x_t(xvb.coords)
@@ -2256,12 +2257,12 @@ def run_sequential_hrex_step(
         if water_sampler is not None:
             assert water_params_by_state is not None
             water_sampler.set_params(water_params_by_state[state_idx])
-            water_sampler.set_step(water_sampler_step)
+            water_sampler.set_step(mover_step)
             assert water_sampler.num_systems() == 1
             starting_water_proposals = water_sampler.n_proposed()[0]
             starting_water_acceptances = water_sampler.n_accepted()[0]
         if barostat is not None:
-            barostat.set_step(barostat_step)
+            barostat.set_step(mover_step)
 
         md_params_replica = replace(
             md_params,
@@ -2340,8 +2341,8 @@ def run_batched_hrex_step(
             params = np.stack(params_by_state_by_pot[i])[state_to_replica]  # type: ignore
             bp.set_params(params)
 
-    # Setup the MC movers of the Context
-    barostat_step, water_sampler_step = _compute_hrex_mover_steps(md_params, current_frame)
+    # Setup the MC movers of the Context; the barostat and water sampler share one step counter.
+    mover_step = _compute_hrex_mover_step(md_params, current_frame)
 
     if water_sampler is not None:
         accepted = np.asarray(water_sampler.n_accepted())[state_to_replica]
@@ -2351,9 +2352,9 @@ def run_batched_hrex_step(
 
         assert water_params_by_state is not None
         water_sampler.set_params(water_params_by_state[state_to_replica])
-        water_sampler.set_step(water_sampler_step)
+        water_sampler.set_step(mover_step)
     if barostat is not None:
-        barostat.set_step(barostat_step)
+        barostat.set_step(mover_step)
 
     md_params_replica = replace(
         md_params,

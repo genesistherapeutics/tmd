@@ -1046,7 +1046,8 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             assert batch_size > 1
 
     def run_bisection_phase() -> tuple[Sequence[InitialState], list[PairBarResult]]:
-        assert md_params.hrex_params is not None  # narrowed at call time; mypy can't see across the closure
+        # Already asserted at function entry; mypy doesn't propagate that narrowing into a nested function body.
+        assert md_params.hrex_params is not None
 
         # First phase: bisection to determine lambda spacing
         md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
@@ -1176,6 +1177,7 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             freshly_computed_schedule = True
 
         def emit_checkpoint(checkpoint: HREXCheckpoint) -> None:
+            # run_sims_hrex_iter has no visibility into the schedule/report, so attach them here.
             if checkpoint_callback is not None:
                 checkpoint_callback(
                     replace(checkpoint, initial_states_hrex=initial_states_hrex, bisection_results=results)
