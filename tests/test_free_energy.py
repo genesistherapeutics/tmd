@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pickle
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 from functools import partial
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -34,6 +35,7 @@ from tmd.fe.atom_mapping import get_cores
 from tmd.fe.bar import DEFAULT_SOLVER_PROTOCOL, IndeterminateEnergyWarning, df_from_u_kln, ukln_to_ukn
 from tmd.fe.free_energy import (
     BarResult,
+    HREXCheckpoint,
     HREXParams,
     HREXSimulationResult,
     InitialState,
@@ -54,6 +56,7 @@ from tmd.fe.free_energy import (
     make_pair_bar_plots,
     run_sims_bisection,
     run_sims_hrex,
+    run_sims_hrex_iter,
     sample,
     trajectories_by_replica_to_by_state,
     verify_and_sanitize_potential_matrix,
@@ -483,6 +486,346 @@ def test_hrex_batching_determinism(dt, seed):
     for batch_sample, ref_sample in zip(batch_samples_by_state, ref_samples_by_state):
         np.testing.assert_equal(np.array(batch_sample.frames), np.array(ref_sample.frames))
         np.testing.assert_equal(np.array(batch_sample.boxes), np.array(ref_sample.boxes))
+
+
+@pytest.mark.nocuda
+@pytest.mark.parametrize("batch_simulations", [False, True], ids=["sequential", "batched"])
+@pytest.mark.parametrize(
+    ("local_steps", "current_iteration", "expected_mover_step"),
+    [
+        (4, 0, 0),
+        (4, 6, 42),
+        (None, 6, 67),
+    ],
+    ids=["fresh-local", "resumed-local", "resumed-global"],
+)
+def test_hrex_checkpoint_mover_step_preserves_fresh_and_resumed_phase(
+    batch_simulations,
+    local_steps,
+    current_iteration,
+    expected_mover_step,
+):
+    completed_frames = 2
+    iterations_per_frame = 3
+    assert current_iteration in (0, completed_frames * iterations_per_frame)
+    md_params = MDParams(
+        n_frames=4,
+        n_eq_steps=7,
+        steps_per_frame=10,
+        seed=2026,
+        local_md_params=LocalMDParams(local_steps=local_steps) if local_steps is not None else None,
+        hrex_params=HREXParams(iterations_per_frame=iterations_per_frame),
+        water_sampling_params=WaterSamplingParams(),
+    )
+    replicas = [
+        CoordsVelBox(np.zeros((1, 3)), np.zeros((1, 3)), np.eye(3)),
+        CoordsVelBox(np.ones((1, 3)), np.zeros((1, 3)), np.eye(3)),
+    ]
+    hrex = HREX.from_replicas(replicas)
+
+    barostat = Mock()
+    barostat.get_volume_scale_factor.return_value = [1.0, 1.0]
+    water_sampler = Mock()
+    water_sampler.num_systems.return_value = 1
+    water_sampler.n_accepted.return_value = [0, 0]
+    water_sampler.n_proposed.return_value = [0, 0]
+    context = Mock()
+    context.get_potentials.return_value = []
+    context.get_barostat.return_value = barostat
+    context.get_movers.return_value = [water_sampler, barostat]
+
+    if batch_simulations:
+        hrex_step = free_energy.run_batched_hrex_step
+        sample_results = [
+            (
+                np.stack([[replica.coords for replica in replicas]]),
+                np.stack([[replica.box for replica in replicas]]),
+                np.stack([replica.velocities for replica in replicas]),
+            )
+        ]
+    else:
+        hrex_step = free_energy.run_sequential_hrex_step
+        sample_results = [
+            (np.array([replica.coords]), np.array([replica.box]), replica.velocities) for replica in replicas
+        ]
+
+    with (
+        patch("tmd.fe.free_energy.WATER_SAMPLER_MOVERS", (type(water_sampler),)),
+        patch(
+            "tmd.fe.free_energy.sample_with_context_iter",
+            side_effect=[iter([sample_result]) for sample_result in sample_results],
+        ) as sample_with_context_iter,
+        patch("tmd.fe.free_energy.batch_compute_potential_matrix", return_value=np.empty((0, 2, 2))),
+    ):
+        hrex_step(
+            hrex,
+            [],
+            [],
+            np.zeros((2, 1, 4)),
+            context,
+            md_params,
+            np.array([], dtype=np.int32),
+            DEFAULT_TEMP,
+            current_iteration,
+        )
+
+    expected_call_count = 1 if batch_simulations else len(replicas)
+    assert [mock_call.args[0] for mock_call in barostat.set_step.call_args_list] == [
+        expected_mover_step
+    ] * expected_call_count
+    assert [mock_call.args[0] for mock_call in water_sampler.set_step.call_args_list] == [
+        expected_mover_step
+    ] * expected_call_count
+    expected_eq_steps = md_params.n_eq_steps if current_iteration == 0 else 0
+    assert [mock_call.args[1].n_eq_steps for mock_call in sample_with_context_iter.call_args_list] == [
+        expected_eq_steps
+    ] * expected_call_count
+
+
+def _setup_hif2a_hrex_initial_states(single_topology):
+    lambdas = np.linspace(0.0, 0.1, 4)
+    return setup_initial_states(
+        single_topology,
+        None,
+        DEFAULT_TEMP,
+        lambdas,
+        seed=2026,
+        verify_constraints=False,
+        min_cutoff=None,
+        dt=1e-3,
+    )
+
+
+def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topology):
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
+    initial_states = [
+        replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
+        for initial_state in initial_states
+    ]
+    md_params = replace(
+        DEFAULT_HREX_PARAMS,
+        n_frames=4,
+        hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=2),
+    )
+
+    reference_result = run_sims_hrex(initial_states, md_params, print_diagnostics_interval=None)
+
+    interrupted = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+    )
+    halfway_checkpoint = pickle.loads(pickle.dumps(next(interrupted)))
+    interrupted.close()
+
+    assert {field.name for field in fields(halfway_checkpoint)} == {
+        "completed_frames",
+        "hrex",
+        "iterated_u_kln",
+        "replica_idx_by_state_by_iter",
+        "fraction_accepted_by_pair_by_iter",
+        "water_sampler_proposals_by_state_by_iter",
+        "initial_states_hrex",
+        "bisection_results",
+        "version",
+    }
+
+    resumed = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+        resume_state=halfway_checkpoint,
+    )
+    final_checkpoint = next(resumed)
+    with pytest.raises(StopIteration) as completed:
+        next(resumed)
+    resumed_result = completed.value.value
+
+    assert halfway_checkpoint.completed_frames == 2
+    assert final_checkpoint.completed_frames == md_params.n_frames
+    n_potentials = len(initial_states[0].potentials)
+    assert halfway_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, 2)
+    assert final_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, md_params.n_frames)
+    assert len(halfway_checkpoint.replica_idx_by_state_by_iter) == 4
+    assert len(final_checkpoint.replica_idx_by_state_by_iter) == 8
+    assert len(final_checkpoint.fraction_accepted_by_pair_by_iter) == 8
+    assert len(final_checkpoint.water_sampler_proposals_by_state_by_iter) == 8
+    np.testing.assert_equal(
+        final_checkpoint.iterated_u_kln[..., : halfway_checkpoint.completed_frames],
+        halfway_checkpoint.iterated_u_kln,
+    )
+    assert final_checkpoint.replica_idx_by_state_by_iter[:4] == halfway_checkpoint.replica_idx_by_state_by_iter
+    assert (
+        final_checkpoint.fraction_accepted_by_pair_by_iter[:4] == halfway_checkpoint.fraction_accepted_by_pair_by_iter
+    )
+    assert (
+        final_checkpoint.water_sampler_proposals_by_state_by_iter[:4]
+        == halfway_checkpoint.water_sampler_proposals_by_state_by_iter
+    )
+
+    reference_pair_bar_result, reference_samples, reference_hrex_diagnostics, reference_ws_diagnostics = (
+        reference_result
+    )
+    resumed_pair_bar_result, resumed_samples, resumed_hrex_diagnostics, resumed_ws_diagnostics = resumed_result
+    expected_resumed_frames = md_params.n_frames - halfway_checkpoint.completed_frames
+    for reference_sample, resumed_sample in zip(reference_samples, resumed_samples):
+        assert len(resumed_sample.frames) == expected_resumed_frames
+        np.testing.assert_equal(
+            np.array(resumed_sample.frames),
+            np.array(reference_sample.frames)[halfway_checkpoint.completed_frames :],
+        )
+        np.testing.assert_equal(
+            np.array(resumed_sample.boxes),
+            np.array(reference_sample.boxes)[halfway_checkpoint.completed_frames :],
+        )
+    np.testing.assert_equal(
+        resumed_pair_bar_result.u_kln_by_component_by_lambda,
+        reference_pair_bar_result.u_kln_by_component_by_lambda,
+    )
+    assert (
+        resumed_hrex_diagnostics.replica_idx_by_state_by_iter == reference_hrex_diagnostics.replica_idx_by_state_by_iter
+    )
+    assert (
+        resumed_hrex_diagnostics.fraction_accepted_by_pair_by_iter
+        == reference_hrex_diagnostics.fraction_accepted_by_pair_by_iter
+    )
+    assert resumed_ws_diagnostics == reference_ws_diagnostics
+
+
+def test_hrex_checkpoint_forced_stop_and_resume_with_batch_simulations(hif2a_ligand_pair_single_topology):
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
+    initial_states = [
+        replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
+        for initial_state in initial_states
+    ]
+    md_params = replace(
+        DEFAULT_HREX_PARAMS,
+        n_frames=4,
+        hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=2),
+    )
+
+    reference_result = run_sims_hrex(initial_states, md_params, print_diagnostics_interval=None, batch_simulations=True)
+
+    interrupted = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+        batch_simulations=True,
+    )
+    halfway_checkpoint = pickle.loads(pickle.dumps(next(interrupted)))
+    interrupted.close()
+
+    resumed = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        print_diagnostics_interval=None,
+        checkpoint_interval_frames=2,
+        resume_state=halfway_checkpoint,
+        batch_simulations=True,
+    )
+    next(resumed)
+    with pytest.raises(StopIteration) as completed:
+        next(resumed)
+    resumed_result = completed.value.value
+
+    reference_pair_bar_result, reference_samples, _, _ = reference_result
+    resumed_pair_bar_result, resumed_samples, _, _ = resumed_result
+    expected_resumed_frames = md_params.n_frames - halfway_checkpoint.completed_frames
+    for reference_sample, resumed_sample in zip(reference_samples, resumed_samples):
+        assert len(resumed_sample.frames) == expected_resumed_frames
+        np.testing.assert_equal(
+            np.array(resumed_sample.frames),
+            np.array(reference_sample.frames)[halfway_checkpoint.completed_frames :],
+        )
+    np.testing.assert_equal(
+        resumed_pair_bar_result.u_kln_by_component_by_lambda,
+        reference_pair_bar_result.u_kln_by_component_by_lambda,
+    )
+
+
+def test_hrex_checkpoint_schedule_only_has_no_production_state(hif2a_ligand_pair_single_topology):
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
+
+    checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=initial_states,
+        bisection_results=[],
+    )
+
+    roundtripped = pickle.loads(pickle.dumps(checkpoint))
+
+    assert roundtripped.completed_frames is None
+    assert [s.lamb for s in roundtripped.initial_states_hrex] == [s.lamb for s in initial_states]
+
+
+def test_hrex_schedule_only_checkpoint_starts_production_like_fresh_run(hif2a_ligand_pair_single_topology):
+    single_topology, _ = hif2a_ligand_pair_single_topology
+    initial_states = _setup_hif2a_hrex_initial_states(single_topology)
+    initial_states = [
+        replace(initial_state, integrator=replace(initial_state.integrator, friction=0.0))
+        for initial_state in initial_states
+    ]
+    md_params = replace(
+        DEFAULT_HREX_PARAMS,
+        n_frames=2,
+        hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=2),
+    )
+
+    schedule_only_checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=initial_states,
+        bisection_results=[Mock()],
+    )
+
+    def run_to_completion(resume_state):
+        sims = run_sims_hrex_iter(
+            initial_states,
+            md_params,
+            print_diagnostics_interval=None,
+            checkpoint_interval_frames=md_params.n_frames,
+            resume_state=resume_state,
+        )
+        final_checkpoint = next(sims)
+        with pytest.raises(StopIteration) as completed:
+            next(sims)
+        return final_checkpoint, completed.value.value
+
+    fresh_checkpoint, fresh_result = run_to_completion(None)
+    resumed_checkpoint, resumed_result = run_to_completion(schedule_only_checkpoint)
+
+    assert fresh_checkpoint.completed_frames == md_params.n_frames
+    assert resumed_checkpoint.completed_frames == fresh_checkpoint.completed_frames
+    np.testing.assert_equal(resumed_checkpoint.iterated_u_kln, fresh_checkpoint.iterated_u_kln)
+    assert resumed_checkpoint.replica_idx_by_state_by_iter == fresh_checkpoint.replica_idx_by_state_by_iter
+    assert resumed_checkpoint.fraction_accepted_by_pair_by_iter == fresh_checkpoint.fraction_accepted_by_pair_by_iter
+
+    fresh_pair_bar_result, fresh_samples, fresh_hrex_diagnostics, _ = fresh_result
+    resumed_pair_bar_result, resumed_samples, resumed_hrex_diagnostics, _ = resumed_result
+    for fresh_sample, resumed_sample in zip(fresh_samples, resumed_samples):
+        assert len(resumed_sample.frames) == md_params.n_frames
+        np.testing.assert_equal(np.array(resumed_sample.frames), np.array(fresh_sample.frames))
+        np.testing.assert_equal(np.array(resumed_sample.boxes), np.array(fresh_sample.boxes))
+    np.testing.assert_equal(
+        resumed_pair_bar_result.u_kln_by_component_by_lambda,
+        fresh_pair_bar_result.u_kln_by_component_by_lambda,
+    )
+    assert resumed_hrex_diagnostics.replica_idx_by_state_by_iter == fresh_hrex_diagnostics.replica_idx_by_state_by_iter
 
 
 @pytest.mark.parametrize("seed", [2024])
@@ -1022,6 +1365,58 @@ def test_trajectories_by_replica_to_by_state(seed, n_states, n_iters, n_atoms):
 
 
 @pytest.mark.nogpu
+@pytest.mark.parametrize("n_suffix_frames", [0, 2])
+def test_hrex_checkpoint_extract_trajectories_aligns_full_diagnostics_to_resumed_suffix(n_suffix_frames):
+    n_states = 2
+    n_atoms = 3
+    n_total_frames = 3
+    iterations_per_frame = 2
+    frames = np.arange(n_states * n_total_frames * n_atoms * 3, dtype=np.float32).reshape(
+        n_states, n_total_frames, n_atoms, 3
+    )
+    suffix_frames = frames[:, n_total_frames - n_suffix_frames :] if n_suffix_frames else frames[:, :0]
+    dummy_box = np.eye(3)
+    trajectories = []
+    for state_frames in suffix_frames:
+        trajectory = Trajectory.empty()
+        if n_suffix_frames:
+            trajectory.frames.extend(state_frames)
+            trajectory.boxes.extend([dummy_box] * n_suffix_frames)
+        trajectories.append(trajectory)
+
+    replica_idx_by_state_by_iter = [
+        [ReplicaIdx(0), ReplicaIdx(1)],
+        [ReplicaIdx(1), ReplicaIdx(0)],
+        [ReplicaIdx(1), ReplicaIdx(0)],
+        [ReplicaIdx(0), ReplicaIdx(1)],
+        [ReplicaIdx(0), ReplicaIdx(1)],
+        [ReplicaIdx(1), ReplicaIdx(0)],
+    ]
+    result = HREXSimulationResult(
+        final_result=Mock(),
+        plots=Mock(),
+        hrex_plots=Mock(),
+        trajectories=trajectories,
+        md_params=Mock(),
+        intermediate_results=[Mock()],
+        hrex_diagnostics=HREXDiagnostics(replica_idx_by_state_by_iter, []),
+        iterations_per_frame=iterations_per_frame,
+    )
+    atom_idxs = np.array([0, 2])
+
+    trajectories_by_replica = result.extract_trajectories_by_replica(atom_idxs)
+
+    assert trajectories_by_replica.shape == (n_states, n_suffix_frames, len(atom_idxs), 3)
+    if n_suffix_frames:
+        expected = np.empty_like(trajectories_by_replica)
+        sampled_frame_permutations = replica_idx_by_state_by_iter[iterations_per_frame - 1 :: iterations_per_frame]
+        for frame_idx, permutation in enumerate(sampled_frame_permutations[-n_suffix_frames:]):
+            for state_idx, replica_idx in enumerate(permutation):
+                expected[int(replica_idx), frame_idx] = suffix_frames[state_idx, frame_idx, atom_idxs]
+        np.testing.assert_array_equal(trajectories_by_replica, expected)
+
+
+@pytest.mark.nogpu
 def test_compute_total_ns(hif2a_ligand_pair_single_topology_lam0_state):
     state = hif2a_ligand_pair_single_topology_lam0_state
 
@@ -1223,3 +1618,217 @@ def test_initial_state_to_bound_impl():
     du_dx, u = bound_impl.execute(x, box, compute_du_dx=True, compute_u=True)
     assert np.isfinite(u)
     assert np.isfinite(du_dx).all()
+
+
+def _make_valid_hrex_checkpoint(n_states=2, n_potentials=1, n_atoms=3, completed_frames=2, iterations_per_frame=2):
+    n_iterations = completed_frames * iterations_per_frame
+    replicas = [CoordsVelBox(np.zeros((n_atoms, 3)), np.zeros((n_atoms, 3)), np.eye(3)) for _ in range(n_states)]
+    permutation = list(range(n_states))
+    return HREXCheckpoint(
+        completed_frames=completed_frames,
+        hrex=HREX.from_replicas(replicas),
+        iterated_u_kln=np.zeros((n_potentials, n_states, n_states, completed_frames)),
+        replica_idx_by_state_by_iter=[list(permutation) for _ in range(n_iterations)],
+        fraction_accepted_by_pair_by_iter=[[(0, 1)] * (n_states - 1) for _ in range(n_iterations)],
+        water_sampler_proposals_by_state_by_iter=[[(0, 1)] * n_states for _ in range(n_iterations)],
+        initial_states_hrex=[Mock()] * n_states,
+        bisection_results=[Mock()],
+    )
+
+
+def _validate_kwargs(n_states=2, n_potentials=1, n_atoms=3, n_frames=2, iterations_per_frame=2):
+    return dict(
+        n_states=n_states,
+        n_potentials=n_potentials,
+        n_atoms=n_atoms,
+        md_params=replace(
+            DEFAULT_HREX_PARAMS,
+            n_frames=n_frames,
+            hrex_params=replace(DEFAULT_HREX_PARAMS.hrex_params, iterations_per_frame=iterations_per_frame),
+        ),
+    )
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_accepts_a_valid_mid_production_checkpoint():
+    _make_valid_hrex_checkpoint().validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_accepts_a_valid_schedule_only_checkpoint():
+    checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+        initial_states_hrex=[Mock(), Mock()],
+        bisection_results=[Mock()],
+    )
+    checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_accepts_a_checkpoint_with_nothing_started():
+    checkpoint = HREXCheckpoint(
+        completed_frames=None,
+        hrex=None,
+        iterated_u_kln=None,
+        replica_idx_by_state_by_iter=[],
+        fraction_accepted_by_pair_by_iter=[],
+        water_sampler_proposals_by_state_by_iter=[],
+    )
+    checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_unsupported_version():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), version=_make_valid_hrex_checkpoint().version + 1)
+    with pytest.raises(ValueError, match="Unsupported HREX checkpoint version"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_requires_hrex_params():
+    checkpoint = _make_valid_hrex_checkpoint()
+    kwargs = _validate_kwargs()
+    kwargs["md_params"] = replace(kwargs["md_params"], hrex_params=None)
+    with pytest.raises(ValueError, match="requires HREX parameters"):
+        checkpoint.validate(**kwargs)
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_schedule_without_bisection_report():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), bisection_results=None)
+    with pytest.raises(ValueError, match="lambda schedule without a bisection report"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_bisection_report_without_schedule():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), initial_states_hrex=None)
+    with pytest.raises(ValueError, match="lambda schedule without a bisection report"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_production_state_without_completed_frames():
+    valid = _make_valid_hrex_checkpoint()
+    checkpoint = replace(valid, completed_frames=None, initial_states_hrex=None, bisection_results=None)
+    with pytest.raises(ValueError, match="no completed_frames but carries production state"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_completed_frames_out_of_range():
+    checkpoint = replace(_make_valid_hrex_checkpoint(completed_frames=2), completed_frames=3)
+    with pytest.raises(ValueError, match="completed_frames must be between 0"):
+        checkpoint.validate(**_validate_kwargs(n_frames=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_missing_hrex_with_completed_frames():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), hrex=None)
+    with pytest.raises(ValueError, match="completed_frames set but no replica state"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_count():
+    checkpoint = _make_valid_hrex_checkpoint(n_states=2)
+    with pytest.raises(ValueError, match="has 2 replicas, expected 3"):
+        checkpoint.validate(**_validate_kwargs(n_states=3))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_coordinate_shape():
+    valid = _make_valid_hrex_checkpoint(n_states=2, n_atoms=3)
+    bad_replica = valid.hrex.replicas[0]._replace(coords=np.zeros((4, 3)))
+    checkpoint = replace(valid, hrex=HREX.from_replicas([bad_replica, valid.hrex.replicas[1]]))
+    with pytest.raises(ValueError, match="coordinate and velocity shapes have invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs(n_atoms=3))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_box_shape():
+    valid = _make_valid_hrex_checkpoint(n_states=2, n_atoms=3)
+    bad_replica = valid.hrex.replicas[0]._replace(box=np.zeros((2, 2)))
+    checkpoint = replace(valid, hrex=HREX.from_replicas([bad_replica, valid.hrex.replicas[1]]))
+    with pytest.raises(ValueError, match="box has invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_permutation():
+    valid = _make_valid_hrex_checkpoint(n_states=2)
+    checkpoint = replace(valid, hrex=replace(valid.hrex, replica_idx_by_state=[ReplicaIdx(0), ReplicaIdx(0)]))
+    with pytest.raises(ValueError, match="current replica permutation is invalid"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_missing_iterated_u_kln():
+    checkpoint = replace(_make_valid_hrex_checkpoint(), iterated_u_kln=None)
+    with pytest.raises(ValueError, match="completed_frames set but no iterated_u_kln"):
+        checkpoint.validate(**_validate_kwargs())
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_iterated_u_kln_shape():
+    checkpoint = replace(_make_valid_hrex_checkpoint(n_potentials=1), iterated_u_kln=np.zeros((2, 2, 2, 2)))
+    with pytest.raises(ValueError, match="iterated_u_kln has shape"):
+        checkpoint.validate(**_validate_kwargs(n_potentials=1))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_replica_permutation_history_length():
+    valid = _make_valid_hrex_checkpoint(completed_frames=2, iterations_per_frame=2)
+    checkpoint = replace(valid, replica_idx_by_state_by_iter=valid.replica_idx_by_state_by_iter[:-1])
+    with pytest.raises(ValueError, match="replica permutation history must contain one valid permutation"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_replica_permutation_history_entry():
+    valid = _make_valid_hrex_checkpoint(n_states=2, completed_frames=2, iterations_per_frame=2)
+    bad_history = [[0, 0]] + valid.replica_idx_by_state_by_iter[1:]
+    checkpoint = replace(valid, replica_idx_by_state_by_iter=bad_history)
+    with pytest.raises(ValueError, match="replica permutation history must contain one valid permutation"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_swap_count_history_length():
+    valid = _make_valid_hrex_checkpoint(completed_frames=2, iterations_per_frame=2)
+    checkpoint = replace(valid, fraction_accepted_by_pair_by_iter=valid.fraction_accepted_by_pair_by_iter[:-1])
+    with pytest.raises(ValueError, match="swap-count history has invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_swap_counts():
+    valid = _make_valid_hrex_checkpoint(n_states=2, completed_frames=2, iterations_per_frame=2)
+    bad_history = [[(2, 1)]] + valid.fraction_accepted_by_pair_by_iter[1:]
+    checkpoint = replace(valid, fraction_accepted_by_pair_by_iter=bad_history)
+    with pytest.raises(ValueError, match="swap-count history contains invalid acceptance/proposal counts"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_wrong_water_proposal_history_length():
+    valid = _make_valid_hrex_checkpoint(completed_frames=2, iterations_per_frame=2)
+    checkpoint = replace(
+        valid, water_sampler_proposals_by_state_by_iter=valid.water_sampler_proposals_by_state_by_iter[:-1]
+    )
+    with pytest.raises(ValueError, match="water-proposal history has invalid dimensions"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))
+
+
+@pytest.mark.nocuda
+def test_hrex_checkpoint_validate_rejects_invalid_water_proposal_counts():
+    valid = _make_valid_hrex_checkpoint(n_states=2, completed_frames=2, iterations_per_frame=2)
+    bad_history = [[(2, 1), (0, 1)]] + valid.water_sampler_proposals_by_state_by_iter[1:]
+    checkpoint = replace(valid, water_sampler_proposals_by_state_by_iter=bad_history)
+    with pytest.raises(ValueError, match="water-proposal history contains invalid acceptance/proposal counts"):
+        checkpoint.validate(**_validate_kwargs(iterations_per_frame=2))

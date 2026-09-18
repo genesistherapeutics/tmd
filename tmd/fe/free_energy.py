@@ -14,9 +14,10 @@
 # limitations under the License.
 
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from functools import cache
+from numbers import Integral
 from typing import Callable, Optional
 from warnings import warn
 
@@ -66,6 +67,8 @@ from tmd.potentials import (
 )
 from tmd.potentials.potential import get_bound_potential_by_type
 from tmd.utils import batches
+
+HREX_CHECKPOINT_VERSION = 1
 
 WATER_SAMPLER_MOVERS = (
     custom_ops.TIBDExchangeMove_f32,
@@ -208,6 +211,100 @@ class MDParams:
         assert self.n_eq_steps >= 0
         if self.local_md_params is not None:
             assert self.local_md_params.local_steps <= self.steps_per_frame
+
+
+def _validate_count_history(
+    history: list[list[tuple[int, int]]], n_iterations: int, counts_per_iteration: int, label: str
+) -> None:
+    if len(history) != n_iterations or any(
+        len(counts_by_item) != counts_per_iteration or any(len(counts) != 2 for counts in counts_by_item)
+        for counts_by_item in history
+    ):
+        raise ValueError(f"HREX checkpoint {label} history has invalid dimensions")
+    if any(
+        not (isinstance(accepted, Integral) and isinstance(proposed, Integral) and 0 <= accepted <= proposed)
+        for counts_by_item in history
+        for accepted, proposed in counts_by_item
+    ):
+        raise ValueError(f"HREX checkpoint {label} history contains invalid acceptance/proposal counts")
+
+
+@dataclass(frozen=True)
+class HREXCheckpoint:
+    # None means no production frame has run yet — check this field, not hrex/iterated_u_kln, to detect that state
+    completed_frames: int | None
+    hrex: HREX[CoordsVelBox] | None
+    iterated_u_kln: NDArray | None
+    replica_idx_by_state_by_iter: list[list[ReplicaIdx]]
+    fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]]
+    water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]]
+    initial_states_hrex: "Sequence[InitialState] | None" = None
+    bisection_results: "list[PairBarResult] | None" = None
+    # Forward-only: a checkpoint pickled before this field existed unpickles with this class-level default, not
+    # an error, so this can't detect that legacy shape. The initial_states_hrex/bisection_results pairing check
+    # below is what actually catches it (that shape always lacks a schedule). Bump HREX_CHECKPOINT_VERSION only
+    # to reject a *future* incompatible schema change from being read by older code.
+    version: int = HREX_CHECKPOINT_VERSION
+
+    def validate(self, n_states: int, n_potentials: int, n_atoms: int, md_params: MDParams) -> None:
+        if self.version != HREX_CHECKPOINT_VERSION:
+            raise ValueError(f"Unsupported HREX checkpoint version: {self.version}")
+        if md_params.hrex_params is None:
+            raise ValueError("HREX checkpoint requires HREX parameters")
+        if (self.initial_states_hrex is None) != (self.bisection_results is None):
+            raise ValueError("HREX checkpoint has a lambda schedule without a bisection report, or vice versa")
+
+        if self.completed_frames is None:
+            if self.hrex is not None or self.iterated_u_kln is not None:
+                raise ValueError("HREX checkpoint has no completed_frames but carries production state")
+            return
+
+        if not 0 <= self.completed_frames <= md_params.n_frames:
+            raise ValueError(
+                f"HREX checkpoint completed_frames must be between 0 and {md_params.n_frames}, "
+                f"got {self.completed_frames}"
+            )
+        if self.hrex is None:
+            raise ValueError("HREX checkpoint has completed_frames set but no replica state")
+        if len(self.hrex.replicas) != n_states:
+            raise ValueError(f"HREX checkpoint has {len(self.hrex.replicas)} replicas, expected {n_states}")
+
+        expected_atom_shape = (n_atoms, 3)
+        for replica in self.hrex.replicas:
+            if np.shape(replica.coords) != expected_atom_shape or np.shape(replica.velocities) != expected_atom_shape:
+                raise ValueError(
+                    "HREX checkpoint replica coordinate and velocity shapes have invalid dimensions; "
+                    f"expected {expected_atom_shape}"
+                )
+            if np.shape(replica.box) != (3, 3):
+                raise ValueError("HREX checkpoint replica box has invalid dimensions")
+
+        expected_permutation = list(range(n_states))
+        if sorted(self.hrex.replica_idx_by_state) != expected_permutation:
+            raise ValueError("HREX checkpoint current replica permutation is invalid")
+
+        if self.iterated_u_kln is None:
+            raise ValueError("HREX checkpoint has completed_frames set but no iterated_u_kln")
+        expected_u_kln_shape = (n_potentials, n_states, n_states, self.completed_frames)
+        if self.iterated_u_kln.shape != expected_u_kln_shape:
+            raise ValueError(
+                f"HREX checkpoint iterated_u_kln has shape {self.iterated_u_kln.shape}, expected {expected_u_kln_shape}"
+            )
+
+        n_completed_iterations = self.completed_frames * md_params.hrex_params.iterations_per_frame
+        if len(self.replica_idx_by_state_by_iter) != n_completed_iterations or any(
+            sorted(permutation) != expected_permutation for permutation in self.replica_idx_by_state_by_iter
+        ):
+            raise ValueError(
+                "HREX checkpoint replica permutation history must contain one valid permutation per completed iteration"
+            )
+
+        _validate_count_history(
+            self.fraction_accepted_by_pair_by_iter, n_completed_iterations, n_states - 1, "swap-count"
+        )
+        _validate_count_history(
+            self.water_sampler_proposals_by_state_by_iter, n_completed_iterations, n_states, "water-proposal"
+        )
 
 
 @dataclass
@@ -413,6 +510,10 @@ class HREXSimulationResult(SimulationResult):
             Indices of atoms to extract
         """
 
+        n_frames = len(self.trajectories[0].frames)
+        if n_frames == 0:
+            return np.empty((len(self.trajectories), 0, len(atom_idxs), 3), dtype=np.float32)
+
         # (states, frames, atoms, 3)
         # NOTE: chunk[:, atom_idxs] below returns a copy (rather than a view) due to the use of "advanced indexing".
         # This is important because otherwise we would try to store all of the whole-system frames in memory at once.
@@ -423,12 +524,17 @@ class HREXSimulationResult(SimulationResult):
             ]
         )
 
-        replica_idx_by_iter_by_state = np.asarray(self.hrex_diagnostics.replica_idx_by_state_by_iter).T
+        n_trajectory_iterations = n_frames * self.iterations_per_frame
+        replica_idx_by_iter_by_state = np.asarray(
+            self.hrex_diagnostics.replica_idx_by_state_by_iter[-n_trajectory_iterations:]
+        ).T
         state_idx_by_iter_by_replica = np.argsort(replica_idx_by_iter_by_state, axis=0)
 
         # (replicas, frames, atoms, 3)
         trajs_by_replica = np.take_along_axis(
-            trajs_by_state, state_idx_by_iter_by_replica[:, :: self.iterations_per_frame, None, None], axis=0
+            trajs_by_state,
+            state_idx_by_iter_by_replica[:, self.iterations_per_frame - 1 :: self.iterations_per_frame, None, None],
+            axis=0,
         )
 
         return trajs_by_replica
@@ -446,6 +552,11 @@ def trajectories_by_replica_to_by_state(
 ) -> NDArray:
     """Utility function to convert the output of `extract_trajectories_by_replica` from (replica, iters, ...) to
     (state, iters, ...). This is useful for evaluating the trajectories of states.
+
+    Note: on a resumed HREXSimulationResult, `extract_trajectories_by_replica`'s output covers only the
+    post-resume suffix, while `hrex_diagnostics.replica_idx_by_state_by_iter` is the full history. Pass the
+    same `[-n_trajectory_iterations:]` slice of it that `extract_trajectories_by_replica` uses internally, not
+    the full history, or the shape assert below will fail.
     """
     assert len(trajectory_by_iter_by_replica.shape) == 4
     replica_idx_by_iter_by_state = np.asarray(replica_idx_by_state_by_iter).T
@@ -2099,6 +2210,22 @@ def generate_pair_bar_ulkns(
     return u_kln_by_component_by_lambda
 
 
+def _compute_hrex_mover_step(md_params: MDParams, current_iteration: int) -> int:
+    # Movers are not called during local steps, so if local moves are mixed in need to account only for global steps
+    local_steps = md_params.local_md_params.local_steps if md_params.local_md_params is not None else 0
+    production_global_steps = md_params.steps_per_frame - local_steps
+    mover_step = current_iteration * production_global_steps
+
+    if current_iteration > 0:
+        equilibration_global_steps = md_params.n_eq_steps
+        if md_params.local_md_params is not None:
+            equilibration_batches = (md_params.n_eq_steps + md_params.steps_per_frame - 1) // md_params.steps_per_frame
+            equilibration_global_steps = equilibration_batches * production_global_steps
+        mover_step += equilibration_global_steps
+
+    return mover_step
+
+
 def run_sequential_hrex_step(
     hrex: HREX,
     nrg_pots: list[custom_ops.Potential_f32],
@@ -2122,6 +2249,8 @@ def run_sequential_hrex_step(
         water_sampler = next(mover for mover in context.get_movers() if isinstance(mover, WATER_SAMPLER_MOVERS))
 
     water_sampling_acceptance_proposal_counts_by_state = [(0, 0) for _ in range(len(hrex.replicas))]
+    # The barostat and water sampler share one step counter: both must see the same phase.
+    mover_step = _compute_hrex_mover_step(md_params, current_frame)
 
     def sample_replica(xvb: CoordsVelBox, state_idx: StateIdx) -> tuple[NDArray, NDArray, NDArray, Optional[float]]:
         context.set_x_t(xvb.coords)
@@ -2131,22 +2260,18 @@ def run_sequential_hrex_step(
         for i, bp in enumerate(bound_potentials):
             bp.set_params(params_by_state_by_pot[i][state_idx])
 
-        # Movers are not called during local steps, so if local moves are mixed in need to account only for global steps
-        current_mover_step = current_frame * md_params.steps_per_frame
-        if md_params.local_md_params is not None:
-            current_mover_step = current_frame * (md_params.steps_per_frame - md_params.local_md_params.local_steps)
         # Setup the MC movers of the Context
         starting_water_acceptances = 0
         starting_water_proposals = 0
         if water_sampler is not None:
             assert water_params_by_state is not None
             water_sampler.set_params(water_params_by_state[state_idx])
-            water_sampler.set_step(current_mover_step)
+            water_sampler.set_step(mover_step)
             assert water_sampler.num_systems() == 1
             starting_water_proposals = water_sampler.n_proposed()[0]
             starting_water_acceptances = water_sampler.n_accepted()[0]
         if barostat is not None:
-            barostat.set_step(current_mover_step)
+            barostat.set_step(mover_step)
 
         md_params_replica = replace(
             md_params,
@@ -2225,7 +2350,9 @@ def run_batched_hrex_step(
             params = np.stack(params_by_state_by_pot[i])[state_to_replica]  # type: ignore
             bp.set_params(params)
 
-    # Setup the MC movers of the Context
+    # Setup the MC movers of the Context; the barostat and water sampler share one step counter.
+    mover_step = _compute_hrex_mover_step(md_params, current_frame)
+
     if water_sampler is not None:
         accepted = np.asarray(water_sampler.n_accepted())[state_to_replica]
         proposed = np.asarray(water_sampler.n_proposed())[state_to_replica]
@@ -2234,6 +2361,9 @@ def run_batched_hrex_step(
 
         assert water_params_by_state is not None
         water_sampler.set_params(water_params_by_state[state_to_replica])
+        water_sampler.set_step(mover_step)
+    if barostat is not None:
+        barostat.set_step(mover_step)
 
     md_params_replica = replace(
         md_params,
@@ -2287,14 +2417,20 @@ def run_batched_hrex_step(
     return hrex, samples_by_state_iter, U_kl_raw, water_sampling_acceptance_proposal_counts_by_state
 
 
-def run_sims_hrex(
+def run_sims_hrex_iter(
     initial_states: Sequence[InitialState],
     md_params: MDParams,
     n_swap_attempts_per_iter: Optional[int] = None,
     print_diagnostics_interval: Optional[int] = 10,
     batch_simulations: bool = False,
-) -> tuple[PairBarResult, list[Trajectory], HREXDiagnostics, WaterSamplingDiagnostics | None]:
-    r"""Sample from a sequence of states using nearest-neighbor Hamiltonian Replica EXchange (HREX).
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+) -> Generator[
+    HREXCheckpoint,
+    None,
+    tuple[PairBarResult, list[Trajectory], HREXDiagnostics, WaterSamplingDiagnostics | None],
+]:
+    r"""Sample with HREX, yielding resumable checkpoints at completed frame boundaries.
 
     See documentation for :py:func:`tmd.md.hrex.run_hrex` for details of the algorithm and implementation.
 
@@ -2311,22 +2447,27 @@ def run_sims_hrex(
         Number of nearest-neighbor swaps to attempt per iteration. Defaults to len(initial_states) ** 4.
 
     print_diagnostics_interval: int or None, optional
-        If not None, print diagnostics every N iterations
+        If not None, print diagnostics every N completed frames
 
     batch_simulations: bool
         Run simulations in batch mode. May result in GPU running out of memory
 
-    Returns
-    -------
-    PairBarResult
-        results of pair BAR free energy analysis
+    resume_state: HREXCheckpoint or None
+        Checkpoint containing the completed production prefix to resume. If ``completed_frames`` is unset
+        (including a schedule-only checkpoint with no production state yet), production starts at frame 0, the
+        same as if ``resume_state`` were None.
 
-    list of Trajectory
-        Trajectory for each state
+    checkpoint_interval_frames: int or None
+        Yield a checkpoint whenever the absolute completed-frame count is a positive multiple of N. The final frame
+        does not force a checkpoint. None disables checkpointing.
 
-    HREXDiagnostics
-        HREX statistics (e.g. swap rates, replica-state distribution)
+    The generator returns the same result tuple as :py:func:`run_sims_hrex` when exhausted.
+    A resumed generator returns only the trajectory suffix sampled after ``resume_state.completed_frames`` because
+    checkpoints omit historical coordinate and box trajectories.
     """
+
+    if checkpoint_interval_frames is not None and checkpoint_interval_frames <= 0:
+        raise ValueError("checkpoint_interval_frames must be positive")
 
     assert md_params.hrex_params is not None
 
@@ -2342,6 +2483,14 @@ def run_sims_hrex(
     # state and use set_params for efficiency
     for s in initial_states[1:]:
         assert_potentials_compatible(initial_states[0].potentials, s.potentials)
+
+    if resume_state is not None:
+        resume_state.validate(
+            n_states=len(initial_states),
+            n_potentials=len(initial_states[0].potentials),
+            n_atoms=len(initial_states[0].x0),
+            md_params=md_params,
+        )
 
     # Set up overall potential and context using the first state.
     if batch_simulations:
@@ -2373,12 +2522,38 @@ def run_sims_hrex(
         # Add an identity move to the mixture to ensure aperiodicity
         neighbor_pairs = [(StateIdx(0), StateIdx(0)), *neighbor_pairs]
 
-    hrex = HREX.from_replicas([CoordsVelBox(s.x0, s.v0, s.box0) for s in initial_states])
-
     samples_by_state: list[Trajectory] = [Trajectory.empty() for _ in initial_states]
-    replica_idx_by_state_by_iter: list[list[ReplicaIdx]] = []
-    water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]] = []
-    fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]] = []
+
+    iterated_u_kln = np.full(
+        (len(initial_states[0].potentials), len(initial_states), len(initial_states), md_params.n_frames),
+        np.inf,
+        dtype=np.float32,
+    )
+
+    if resume_state is None or resume_state.completed_frames is None:
+        completed_frames = 0
+        hrex = HREX.from_replicas([CoordsVelBox(s.x0, s.v0, s.box0) for s in initial_states])
+        replica_idx_by_state_by_iter: list[list[ReplicaIdx]] = []
+        water_sampler_proposals_by_state_by_iter: list[list[tuple[int, int]]] = []
+        fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]] = []
+    else:
+        completed_frames = resume_state.completed_frames
+        assert resume_state.hrex is not None
+        assert resume_state.iterated_u_kln is not None
+        hrex = resume_state.hrex
+        iterated_u_kln[..., :completed_frames] = resume_state.iterated_u_kln
+        replica_idx_by_state_by_iter = [list(permutation) for permutation in resume_state.replica_idx_by_state_by_iter]
+        water_sampler_proposals_by_state_by_iter = [
+            list(counts_by_state) for counts_by_state in resume_state.water_sampler_proposals_by_state_by_iter
+        ]
+        fraction_accepted_by_pair_by_iter = [
+            list(counts_by_pair) for counts_by_pair in resume_state.fraction_accepted_by_pair_by_iter
+        ]
+
+        if batch_simulations:
+            context.set_x_t(np.stack([replica.coords for replica in hrex.replicas]))
+            context.set_v_t(np.stack([replica.velocities for replica in hrex.replicas]))
+            context.set_box(np.stack([replica.box for replica in hrex.replicas]))
 
     if (
         md_params.water_sampling_params is not None
@@ -2388,19 +2563,15 @@ def run_sims_hrex(
 
     begin_loop_time = time.perf_counter()
     last_update_time = begin_loop_time
+    last_update_frame = completed_frames
+    starting_frame = completed_frames
 
     kBT = temperature * BOLTZ
-
-    iterated_u_kln = np.full(
-        (len(initial_states[0].potentials), len(initial_states), len(initial_states), md_params.n_frames),
-        np.inf,
-        dtype=np.float32,
-    )
 
     hrex_func = run_sequential_hrex_step if not batch_simulations else run_batched_hrex_step
 
     iters_per_frame = md_params.hrex_params.iterations_per_frame
-    for current_frame in range(md_params.n_frames):
+    for current_frame in range(completed_frames, md_params.n_frames):
         for i in range(iters_per_frame):
             hrex, samples_by_state_iter, U_kl_raw, water_sampler_proposals_by_state = hrex_func(
                 hrex,
@@ -2457,8 +2628,8 @@ def run_sims_hrex(
             instantaneous_swap_acceptance_rates = get_swap_acceptance_rates(fraction_accepted_by_pair)
             average_swap_acceptance_rates = get_swap_acceptance_rates(np.sum(fraction_accepted_by_pair_by_iter, axis=0))
 
-            wall_time_per_frame_current = (current_time - last_update_time) / print_diagnostics_interval
-            wall_time_per_frame_average = (current_time - begin_loop_time) / (current_frame + 1)
+            wall_time_per_frame_current = (current_time - last_update_time) / (current_frame + 1 - last_update_frame)
+            wall_time_per_frame_average = (current_time - begin_loop_time) / (current_frame + 1 - starting_frame)
             estimated_wall_time_remaining = wall_time_per_frame_average * (md_params.n_frames - (current_frame + 1))
 
             def format_rate(r):
@@ -2484,6 +2655,30 @@ def run_sims_hrex(
             print()
 
             last_update_time = current_time
+            last_update_frame = current_frame + 1
+
+        completed_frames = current_frame + 1
+        if checkpoint_interval_frames is not None and completed_frames % checkpoint_interval_frames == 0:
+            checkpoint_replicas = [
+                CoordsVelBox(
+                    np.array(replica.coords, copy=True),
+                    np.array(replica.velocities, copy=True),
+                    np.array(replica.box, copy=True),
+                )
+                for replica in hrex.replicas
+            ]
+            yield HREXCheckpoint(
+                completed_frames=completed_frames,
+                hrex=HREX(checkpoint_replicas, list(hrex.replica_idx_by_state)),
+                iterated_u_kln=iterated_u_kln[..., :completed_frames].copy(),
+                replica_idx_by_state_by_iter=[list(permutation) for permutation in replica_idx_by_state_by_iter],
+                fraction_accepted_by_pair_by_iter=[
+                    list(counts_by_pair) for counts_by_pair in fraction_accepted_by_pair_by_iter
+                ],
+                water_sampler_proposals_by_state_by_iter=[
+                    list(counts_by_state) for counts_by_state in water_sampler_proposals_by_state_by_iter
+                ],
+            )
 
     neighbor_ulkns_by_component = [iterated_u_kln[:, i : i + 2, i : i + 2, :] for i in range(len(initial_states) - 1)]
 
@@ -2498,6 +2693,64 @@ def run_sims_hrex(
         ws_diagnostics = WaterSamplingDiagnostics(np.array(water_sampler_proposals_by_state_by_iter, dtype=np.int32))
 
     return PairBarResult(list(initial_states), pair_bar_results), samples_by_state, hrex_diagnostics, ws_diagnostics
+
+
+def run_sims_hrex(
+    initial_states: Sequence[InitialState],
+    md_params: MDParams,
+    n_swap_attempts_per_iter: Optional[int] = None,
+    print_diagnostics_interval: Optional[int] = 10,
+    batch_simulations: bool = False,
+) -> tuple[PairBarResult, list[Trajectory], HREXDiagnostics, WaterSamplingDiagnostics | None]:
+    r"""Sample from a sequence of states using nearest-neighbor Hamiltonian Replica EXchange (HREX).
+
+    See documentation for :py:func:`tmd.md.hrex.run_hrex` for details of the algorithm and implementation.
+
+    Parameters
+    ----------
+    initial_states: sequence of InitialState
+        States to sample. Should be ordered such that adjacent states have significant overlap for good mixing
+        performance
+
+    md_params: MDParams
+        MD parameters
+
+    n_swap_attempts_per_iter: int or None, optional
+        Number of nearest-neighbor swaps to attempt per iteration. Defaults to len(initial_states) ** 4.
+
+    print_diagnostics_interval: int or None, optional
+        If not None, print diagnostics every N completed frames
+
+    batch_simulations: bool
+        Run simulations in batch mode. May result in GPU running out of memory
+
+    Returns
+    -------
+    PairBarResult
+        results of pair BAR free energy analysis
+
+    list of Trajectory
+        Trajectory for each state
+
+    HREXDiagnostics
+        HREX statistics (e.g. swap rates, replica-state distribution)
+
+    WaterSamplingDiagnostics or None
+        Water-sampling acceptance and proposal counts, or None when water sampling is disabled
+    """
+    results = run_sims_hrex_iter(
+        initial_states,
+        md_params,
+        n_swap_attempts_per_iter,
+        print_diagnostics_interval,
+        batch_simulations,
+        checkpoint_interval_frames=None,
+    )
+    try:
+        while True:
+            next(results)
+    except StopIteration as completed:
+        return completed.value
 
 
 # TBD: Move this elsewhere, this file is way too large
