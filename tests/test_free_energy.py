@@ -790,7 +790,7 @@ def test_hrex_schedule_only_checkpoint_starts_production_like_fresh_run(hif2a_li
         fraction_accepted_by_pair_by_iter=[],
         water_sampler_proposals_by_state_by_iter=[],
         initial_states_hrex=initial_states,
-        bisection_results=None,
+        bisection_results=[Mock()],
     )
 
     def run_to_completion(resume_state):
