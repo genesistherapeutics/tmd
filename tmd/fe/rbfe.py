@@ -1371,16 +1371,22 @@ def estimate_relative_free_energy_bisection_hrex(
     lambda_grid = bisection_lambda_schedule(n_windows, lambda_interval=lambda_interval)
 
     t0 = time.perf_counter()
-    initial_states = setup_initial_states(
-        single_topology,
-        host_config,
-        temperature,
-        lambda_grid,
-        md_params.seed,
-        False,
-        min_cutoff=min_cutoff,
-        dt=md_params.dt,
-    )
+    if resume_state is not None and resume_state.initial_states_hrex is not None:
+        # A locked schedule means the trial phase (and therefore make_optimized_initial_state_fn, built
+        # below from this) never runs; skip the minimization sweep entirely rather than compute and
+        # discard it.
+        initial_states: list[InitialState] = []
+    else:
+        initial_states = setup_initial_states(
+            single_topology,
+            host_config,
+            temperature,
+            lambda_grid,
+            md_params.seed,
+            False,
+            min_cutoff=min_cutoff,
+            dt=md_params.dt,
+        )
     print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
 
     make_initial_state_fn = partial(

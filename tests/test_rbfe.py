@@ -148,6 +148,57 @@ def test_hrex_entry_point_forwards_checkpoint_arguments_to_implementation():
     }
 
 
+def test_hrex_entry_point_skips_minimization_sweep_when_resuming_with_saved_schedule():
+    md_params = make_hrex_md_params()
+    resume_state = make_production_checkpoint(2, initial_states_hrex=[StubInitialState(0.3)])
+    expected_result = Mock()
+
+    with (
+        patch("tmd.fe.rbfe.SingleTopology"),
+        patch("tmd.fe.rbfe.bisection_lambda_schedule", return_value=np.array([0.0, 1.0])),
+        patch("tmd.fe.rbfe.setup_initial_states") as setup_initial_states,
+        patch("tmd.fe.rbfe.get_mol_name", return_value="mol"),
+        patch("tmd.fe.rbfe.estimate_relative_free_energy_bisection_hrex_impl", return_value=expected_result),
+    ):
+        estimate_relative_free_energy_bisection_hrex(
+            Mock(),
+            Mock(),
+            np.empty((0, 2), dtype=np.int32),
+            Mock(),
+            None,
+            md_params=md_params,
+            n_windows=2,
+            resume_state=resume_state,
+        )
+
+    setup_initial_states.assert_not_called()
+
+
+def test_hrex_entry_point_runs_minimization_sweep_on_fresh_run():
+    md_params = make_hrex_md_params()
+    expected_result = Mock()
+
+    with (
+        patch("tmd.fe.rbfe.SingleTopology"),
+        patch("tmd.fe.rbfe.bisection_lambda_schedule", return_value=np.array([0.0, 1.0])),
+        patch("tmd.fe.rbfe.setup_initial_states", return_value=[Mock(), Mock()]) as setup_initial_states,
+        patch("tmd.fe.rbfe.get_mol_name", return_value="mol"),
+        patch("tmd.fe.rbfe.estimate_relative_free_energy_bisection_hrex_impl", return_value=expected_result),
+    ):
+        estimate_relative_free_energy_bisection_hrex(
+            Mock(),
+            Mock(),
+            np.empty((0, 2), dtype=np.int32),
+            Mock(),
+            None,
+            md_params=md_params,
+            n_windows=2,
+            resume_state=None,
+        )
+
+    setup_initial_states.assert_called_once()
+
+
 @pytest.mark.parametrize("leg_name", ["vacuum", "solvent", "complex"])
 def test_rbfe_leg_forwards_checkpoint_arguments(leg_name):
     md_params = make_hrex_md_params()

@@ -552,6 +552,11 @@ def trajectories_by_replica_to_by_state(
 ) -> NDArray:
     """Utility function to convert the output of `extract_trajectories_by_replica` from (replica, iters, ...) to
     (state, iters, ...). This is useful for evaluating the trajectories of states.
+
+    Note: on a resumed HREXSimulationResult, `extract_trajectories_by_replica`'s output covers only the
+    post-resume suffix, while `hrex_diagnostics.replica_idx_by_state_by_iter` is the full history. Pass the
+    same `[-n_trajectory_iterations:]` slice of it that `extract_trajectories_by_replica` uses internally, not
+    the full history, or the shape assert below will fail.
     """
     assert len(trajectory_by_iter_by_replica.shape) == 4
     replica_idx_by_iter_by_state = np.asarray(replica_idx_by_state_by_iter).T
