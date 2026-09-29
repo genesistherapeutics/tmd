@@ -31,18 +31,20 @@ from tmd.constants import DEFAULT_POSITIONAL_RESTRAINT_K, DEFAULT_PRESSURE, DEFA
 from tmd.fe import model_utils
 from tmd.fe.bar import DEFAULT_MAXIMUM_ITERATIONS, DEFAULT_RELATIVE_TOLERANCE, DEFAULT_SOLVER_PROTOCOL
 from tmd.fe.free_energy import (
+    HREXCheckpoint,
     HREXParams,
     HREXPlots,
     HREXSimulationResult,
     InitialState,
     MDParams,
+    PairBarResult,
     RESTParams,
     SimulationResult,
     Trajectory,
     compute_u_kn,
     make_pair_bar_plots,
     run_sims_bisection,
-    run_sims_hrex,
+    run_sims_hrex_iter,
     run_sims_sequential,
 )
 from tmd.fe.lambda_schedule import bisection_lambda_schedule
@@ -753,20 +755,55 @@ def estimate_relative_free_energy(
         raise err
 
 
-def estimate_relative_free_energy_bisection_or_hrex(*args, **kwargs) -> SimulationResult:
-    """
-    See `estimate_relative_free_energy_bisection` for parameters.
+def estimate_relative_free_energy_bisection_or_hrex(
+    *args,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
+    **kwargs,
+) -> SimulationResult:
+    """Dispatch to bisection with or without HREX according to ``md_params.hrex_params``.
 
-    Will call `estimate_relative_free_energy_bisection` or `estimate_relative_free_energy_bisection_hrex`
-    as appropriate given md_params.
+    See :py:func:`estimate_relative_free_energy_bisection` for shared parameters.
+
+    Parameters
+    ----------
+    resume_state: HREXCheckpoint or None
+        Checkpoint to resume from. See :py:func:`estimate_relative_free_energy_bisection_hrex_impl` for how a
+        saved lambda schedule and production state are each handled on resume.
+
+    checkpoint_interval_frames: int or None
+        Generate a production checkpoint whenever the absolute completed-frame count is a positive multiple of
+        N. The final frame does not force a checkpoint. None disables per-interval production checkpoints, but
+        does not suppress the one-time checkpoint fired right after the trial phase when checkpoint_callback is
+        set.
+
+    checkpoint_callback: callable(HREXCheckpoint) or None
+        Called synchronously for each generated checkpoint: once right after the trial phase completes (with
+        production fields empty), and then once per checkpoint_interval_frames during production. The
+        pre-production call is skipped when resume_state already carries a locked schedule, since the trial
+        phase itself is skipped in that case.
+
+    Raises
+    ------
+    ValueError
+        If a checkpoint argument is provided when ``md_params.hrex_params`` is None.
 
     """
     hrex_params = kwargs["md_params"].hrex_params
 
     if hrex_params is not None:
-        return estimate_relative_free_energy_bisection_hrex(*args, **kwargs)
-    else:
-        return estimate_relative_free_energy_bisection(*args, **kwargs)
+        return estimate_relative_free_energy_bisection_hrex(
+            *args,
+            resume_state=resume_state,
+            checkpoint_interval_frames=checkpoint_interval_frames,
+            checkpoint_callback=checkpoint_callback,
+            **kwargs,
+        )
+    checkpoint_args = (resume_state, checkpoint_interval_frames, checkpoint_callback)
+    if any(checkpoint_arg is not None for checkpoint_arg in checkpoint_args):
+        raise ValueError("HREX checkpoint arguments require HREX parameters")
+    return estimate_relative_free_energy_bisection(*args, **kwargs)
 
 
 def estimate_relative_free_energy_bisection(
@@ -926,6 +963,9 @@ def estimate_relative_free_energy_bisection_hrex_impl(
     optimize_initial_state_fn: Callable[[InitialState], InitialState],
     combined_prefix: str,
     min_overlap: Optional[float] = None,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
 ) -> HREXSimulationResult:
     """
     Parameters
@@ -959,6 +999,25 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         If not None, terminate bisection early when the BAR overlap between all neighboring pairs of states exceeds this
         value. When given, the final number of windows may be less than or equal to n_windows.
 
+    resume_state: HREXCheckpoint or None
+        Checkpoint to resume from. If it carries a saved lambda schedule (initial_states_hrex), the trial
+        (bisection) phase is skipped and that schedule and its diagnostic report are reused instead of
+        recomputed. If it also carries production state (completed_frames set), production resumes from the
+        saved frame count and replica state and returned trajectories contain only the post-resume suffix;
+        otherwise production starts at frame 0 on the reused schedule.
+
+    checkpoint_interval_frames: int or None
+        Generate a production checkpoint whenever the absolute completed-frame count is a positive multiple of
+        N. The final frame does not force a checkpoint. None disables per-interval production checkpoints, but
+        does not suppress the one-time checkpoint fired right after the trial phase when checkpoint_callback is
+        set (see checkpoint_callback).
+
+    checkpoint_callback: callable(HREXCheckpoint) or None
+        Called synchronously for each generated checkpoint: once right after the trial phase completes (with
+        production fields empty), and then once per checkpoint_interval_frames during production. The
+        pre-production call is skipped when resume_state already carries a locked schedule, since the trial
+        phase itself is skipped in that case.
+
     Returns
     -------
     HREXSimulationResult
@@ -990,7 +1049,10 @@ def estimate_relative_free_energy_bisection_hrex_impl(
             batch_size = int(batch_flag)
             assert batch_size > 1
 
-    try:
+    def run_bisection_phase() -> tuple[Sequence[InitialState], list[PairBarResult]]:
+        # Already asserted at function entry; mypy doesn't propagate that narrowing into a nested function body.
+        assert md_params.hrex_params is not None
+
         # First phase: bisection to determine lambda spacing
         md_params_bisection = replace(md_params, n_frames=md_params.hrex_params.n_frames_bisection)
 
@@ -1015,7 +1077,9 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         has_barostat_by_state = [initial_state.barostat is not None for initial_state in initial_states]
         assert all(has_barostat_by_state) or not any(has_barostat_by_state)
 
-        def get_mean_final_barostat_volume_scale_factor(trajectories_by_state: Iterable[Trajectory]) -> Optional[float]:
+        def get_mean_final_barostat_volume_scale_factor(
+            trajectories_by_state: Iterable[Trajectory],
+        ) -> Optional[float]:
             scale_factors = [traj.final_barostat_volume_scale_factor for traj in trajectories_by_state]
             if any(x is not None for x in scale_factors):
                 assert all(x is not None for x in scale_factors)
@@ -1071,7 +1135,6 @@ def estimate_relative_free_energy_bisection_hrex_impl(
                     else None
                 ),
             )
-            # Verify that the forces of the system are reasonable
             return updated_state
 
         t0 = time.perf_counter()
@@ -1090,13 +1153,68 @@ def estimate_relative_free_energy_bisection_hrex_impl(
         # Delete the summed potential to reduce GPU memory usage
         del summed_pot
 
+        return initial_states_hrex, results
+
+    try:
+        if (
+            resume_state is not None
+            and resume_state.completed_frames is not None
+            and resume_state.initial_states_hrex is None
+        ):
+            # Production state without a saved schedule is not a state this code's own checkpoint-writing path
+            # can produce (every checkpoint taken after the trial phase carries the schedule); it's only
+            # reachable from a checkpoint written before schedule persistence existed. Recomputing a schedule
+            # here and splicing this resume_state's production state onto it is exactly the silent-corruption
+            # risk this feature exists to eliminate, so refuse rather than guess.
+            raise ValueError(
+                "resume_state has production state (completed_frames is set) but no saved lambda schedule "
+                "(initial_states_hrex is None); this checkpoint predates schedule persistence and cannot be "
+                "safely resumed"
+            )
+        if resume_state is not None and resume_state.initial_states_hrex is not None:
+            initial_states_hrex = resume_state.initial_states_hrex
+            assert resume_state.bisection_results is not None
+            results = resume_state.bisection_results
+            freshly_computed_schedule = False
+        else:
+            initial_states_hrex, results = run_bisection_phase()
+            freshly_computed_schedule = True
+
+        def emit_checkpoint(checkpoint: HREXCheckpoint) -> None:
+            # run_sims_hrex_iter has no visibility into the schedule/report, so attach them here.
+            if checkpoint_callback is not None:
+                checkpoint_callback(
+                    replace(checkpoint, initial_states_hrex=initial_states_hrex, bisection_results=results)
+                )
+
+        if freshly_computed_schedule:
+            emit_checkpoint(
+                HREXCheckpoint(
+                    completed_frames=None,
+                    hrex=None,
+                    iterated_u_kln=None,
+                    replica_idx_by_state_by_iter=[],
+                    fraction_accepted_by_pair_by_iter=[],
+                    water_sampler_proposals_by_state_by_iter=[],
+                )
+            )
+
         # Second phase: sample initial states determined by bisection using HREX
         t0 = time.perf_counter()
-        pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = run_sims_hrex(
+        hrex_results = run_sims_hrex_iter(
             initial_states_hrex,
             replace(md_params, n_eq_steps=0),  # using pre-equilibrated samples
             batch_simulations=batch_simulations,
+            resume_state=resume_state,
+            checkpoint_interval_frames=checkpoint_interval_frames,
         )
+        while True:
+            try:
+                checkpoint = next(hrex_results)
+            except StopIteration as completed:
+                pair_bar_result, trajectories_by_state, hrex_diagnostics, ws_diagnostics = completed.value
+                break
+            emit_checkpoint(checkpoint)
         print(f"[TIMER] production_hrex {time.perf_counter() - t0:.2f}s", flush=True)
 
         t0 = time.perf_counter()
@@ -1145,6 +1263,9 @@ def estimate_relative_free_energy_bisection_hrex(
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = 0.7,
     temperature: float = DEFAULT_TEMP,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
 ) -> HREXSimulationResult:
     """
     Estimate relative free energy between mol_a and mol_b using Hamiltonian Replica EXchange (HREX) sampling of a
@@ -1169,7 +1290,7 @@ def estimate_relative_free_energy_bisection_hrex(
         Configuration for the host system. If None, then the vacuum leg is run.
 
     md_params: MDParams, optional
-        Parameters for the equilibration and production MD. Defaults to :py:const:`tmd.fe.rbfe.DEFAULT_MD_PARAMS`
+        Parameters for the equilibration and production MD. Defaults to :py:const:`tmd.fe.rbfe.DEFAULT_HREX_PARAMS`
 
     prefix: str, optional
         A prefix to append to figures
@@ -1191,6 +1312,25 @@ def estimate_relative_free_energy_bisection_hrex(
 
     temperature: float
         Temperature (Kelvin) to run simulation at, defaults to tmd.constants.DEFAULT_TEMP
+
+    resume_state: HREXCheckpoint or None
+        Checkpoint to resume from. If it carries a saved lambda schedule (initial_states_hrex), the trial
+        (bisection) phase is skipped and that schedule and its diagnostic report are reused instead of
+        recomputed. If it also carries production state (completed_frames set), production resumes from the
+        saved frame count and replica state and returned trajectories contain only the post-resume suffix;
+        otherwise production starts at frame 0 on the reused schedule.
+
+    checkpoint_interval_frames: int or None
+        Generate a production checkpoint whenever the absolute completed-frame count is a positive multiple of
+        N. The final frame does not force a checkpoint. None disables per-interval production checkpoints, but
+        does not suppress the one-time checkpoint fired right after the trial phase when checkpoint_callback is
+        set (see checkpoint_callback).
+
+    checkpoint_callback: callable(HREXCheckpoint) or None
+        Called synchronously for each generated checkpoint: once right after the trial phase completes (with
+        production fields empty), and then once per checkpoint_interval_frames during production. The
+        pre-production call is skipped when resume_state already carries a locked schedule, since the trial
+        phase itself is skipped in that case.
 
     Returns
     -------
@@ -1231,16 +1371,22 @@ def estimate_relative_free_energy_bisection_hrex(
     lambda_grid = bisection_lambda_schedule(n_windows, lambda_interval=lambda_interval)
 
     t0 = time.perf_counter()
-    initial_states = setup_initial_states(
-        single_topology,
-        host_config,
-        temperature,
-        lambda_grid,
-        md_params.seed,
-        False,
-        min_cutoff=min_cutoff,
-        dt=md_params.dt,
-    )
+    if resume_state is not None and resume_state.initial_states_hrex is not None:
+        # A locked schedule means the trial phase (and therefore make_optimized_initial_state_fn, built
+        # below from this) never runs; skip the minimization sweep entirely rather than compute and
+        # discard it.
+        initial_states: list[InitialState] = []
+    else:
+        initial_states = setup_initial_states(
+            single_topology,
+            host_config,
+            temperature,
+            lambda_grid,
+            md_params.seed,
+            False,
+            min_cutoff=min_cutoff,
+            dt=md_params.dt,
+        )
     print(f"[TIMER] minimization {time.perf_counter() - t0:.2f}s", flush=True)
 
     make_initial_state_fn = partial(
@@ -1271,6 +1417,9 @@ def estimate_relative_free_energy_bisection_hrex(
         make_optimized_initial_state_fn,
         combined_prefix,
         min_overlap,
+        resume_state=resume_state,
+        checkpoint_interval_frames=checkpoint_interval_frames,
+        checkpoint_callback=checkpoint_callback,
     )
 
 
@@ -1284,6 +1433,9 @@ def run_vacuum(
     n_windows: Optional[int] = None,
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = None,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
 ):
     if md_params is not None and md_params.local_md_params is not None:
         md_params = replace(md_params, local_md_params=None)
@@ -1303,6 +1455,9 @@ def run_vacuum(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        resume_state=resume_state,
+        checkpoint_interval_frames=checkpoint_interval_frames,
+        checkpoint_callback=checkpoint_callback,
     )
 
 
@@ -1317,6 +1472,9 @@ def run_solvent(
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = None,
     box_width: float = 4.0,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
 ):
     if md_params is not None and md_params.water_sampling_params is not None:
         md_params = replace(md_params, water_sampling_params=None)
@@ -1338,6 +1496,9 @@ def run_solvent(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        resume_state=resume_state,
+        checkpoint_interval_frames=checkpoint_interval_frames,
+        checkpoint_callback=checkpoint_callback,
     )
     return solvent_res, solvent_host_config
 
@@ -1353,6 +1514,9 @@ def run_complex(
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = 0.7,
     add_membrane: bool = False,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
 ):
     if not add_membrane:
         complex_host_config = builders.build_protein_system(
@@ -1374,5 +1538,8 @@ def run_complex(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        resume_state=resume_state,
+        checkpoint_interval_frames=checkpoint_interval_frames,
+        checkpoint_callback=checkpoint_callback,
     )
     return complex_res, complex_host_config
