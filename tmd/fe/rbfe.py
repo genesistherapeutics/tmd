@@ -1555,6 +1555,9 @@ def run_with_host_config(
     n_windows: Optional[int] = None,
     min_overlap: Optional[float] = None,
     min_cutoff: Optional[float] = 0.7,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
 ):
     """Optimize a prebuilt host and run an RBFE leg.
 
@@ -1567,6 +1570,9 @@ def run_with_host_config(
     ----------
     prefix: str
         Label used in output filenames and plots, such as "complex" or "solvent".
+
+    resume_state, checkpoint_interval_frames, checkpoint_callback
+        See :py:func:`estimate_relative_free_energy_bisection_or_hrex`.
 
     Returns
     -------
@@ -1587,6 +1593,9 @@ def run_with_host_config(
         n_windows=n_windows,
         min_overlap=min_overlap,
         min_cutoff=min_cutoff,
+        resume_state=resume_state,
+        checkpoint_interval_frames=checkpoint_interval_frames,
+        checkpoint_callback=checkpoint_callback,
     )
     return result, optimized_host_config
 
