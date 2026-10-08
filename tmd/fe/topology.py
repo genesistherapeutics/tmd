@@ -59,7 +59,7 @@ class HostGuestTopology:
     ):
         """
         Utility tool for combining host with a guest, in that order. host_potentials must be comprised
-        exclusively of supported potentials (currently: bonds, angles, torsions, nonbonded).
+        of bonds, angles, torsions, nonbonded, and a FlatBottomRestraint.
 
         Parameters
         ----------
@@ -80,18 +80,20 @@ class HostGuestTopology:
         self.ff = ff
         self.omm_topology = omm_topology
 
-        assert len(host_potentials) == 5
+        assert len(host_potentials) == 6
         assert isinstance(host_potentials[0].potential, potentials.HarmonicBond)
         assert isinstance(host_potentials[1].potential, potentials.HarmonicAngle)
         assert isinstance(host_potentials[2].potential, potentials.PeriodicTorsion)  # proper
         assert isinstance(host_potentials[3].potential, potentials.PeriodicTorsion)  # improper
         assert isinstance(host_potentials[4].potential, potentials.Nonbonded)
+        assert isinstance(host_potentials[5].potential, potentials.FlatBottomRestraint)
 
         self.host_harmonic_bond = host_potentials[0]
         self.host_harmonic_angle = host_potentials[1]
         self.host_proper_torsion = host_potentials[2]
         self.host_improper_torsion = host_potentials[3]
         self.host_nonbonded = host_potentials[4]
+        self.host_positional_restraint = host_potentials[5]
 
         assert self.host_nonbonded is not None
         self.num_host_atoms = self.host_nonbonded.potential.num_atoms
@@ -183,6 +185,10 @@ class HostGuestTopology:
         guest_params, guest_potential = self.guest_topology.parameterize_improper_torsion(improper_params)
         return self._parameterize_bonded_term(guest_params, guest_potential, self.host_improper_torsion)
 
+    def parameterize_positional_restraint(self):
+        bound = self.host_positional_restraint
+        return bound.params, replace(bound.potential, num_atoms=self.get_num_atoms())
+
     def parameterize_nonbonded(
         self,
         ff_q_params,
@@ -266,7 +272,7 @@ class BaseTopology:
 
     def get_constraint_groups(self) -> ConstraintGroups:
         """Return the hydrogen-bond constraint groups for the molecule."""
-        return get_hydrogen_bond_constraint_groups(self.mol)
+        return get_hydrogen_bond_constraint_groups(self.mol, self.ff)
 
     def parameterize_nonbonded(
         self,
@@ -378,7 +384,11 @@ class BaseTopology:
         params, idxs = self.ff.it_handle.partial_parameterize(ff_params, self.mol)
         return params, potentials.PeriodicTorsion(self.get_num_atoms(), idxs)
 
-    def setup_chiral_restraints(self, chiral_atom_restraint_k, chiral_bond_restraint_k):
+    def parameterize_positional_restraint(self):
+        bound = potentials.FlatBottomRestraint.empty_bound(self.get_num_atoms())
+        return bound.params, bound.potential
+
+    def setup_chiral_restraints(self, chiral_atom_restraint_k: float, chiral_bond_restraint_k: float):
         """
         Create chiral atom and bond potentials.
 
@@ -411,20 +421,20 @@ class BaseTopology:
 
         # chiral bonds
         chiral_bonds = chiral_utils.find_chiral_bonds(mol)
-        chiral_bond_restr_idxs = []
-        chiral_bond_restr_signs = []
-        chiral_bond_params = []
+        chiral_bond_restr_idxs_ = []
+        chiral_bond_restr_signs_ = []
+        chiral_bond_params_ = []
         for src_idx, dst_idx in chiral_bonds:
             idxs, signs = chiral_utils.setup_chiral_bond_restraints(mol, conf, src_idx, dst_idx)
             for ii in idxs:
-                assert ii not in chiral_bond_restr_idxs
-            chiral_bond_restr_idxs.extend(idxs)
-            chiral_bond_restr_signs.extend(signs)
-            chiral_bond_params.extend(chiral_bond_restraint_k for _ in idxs)  # TODO: double-check this
+                assert ii not in chiral_bond_restr_idxs_
+            chiral_bond_restr_idxs_.extend(idxs)
+            chiral_bond_restr_signs_.extend(signs)
+            chiral_bond_params_.extend(chiral_bond_restraint_k for _ in idxs)  # TODO: double-check this
 
-        chiral_bond_restr_idxs = np.array(chiral_bond_restr_idxs, dtype=np.int32).reshape(-1, 4)
-        chiral_bond_restr_signs = np.array(chiral_bond_restr_signs)
-        chiral_bond_params = np.array(chiral_bond_params)
+        chiral_bond_restr_idxs = np.array(chiral_bond_restr_idxs_, dtype=np.int32).reshape(-1, 4)
+        chiral_bond_restr_signs = np.array(chiral_bond_restr_signs_)
+        chiral_bond_params = np.array(chiral_bond_params_)
         chiral_bond_potential = potentials.ChiralBondRestraint(
             self.get_num_atoms(), chiral_bond_restr_idxs, chiral_bond_restr_signs
         ).bind(chiral_bond_params)
@@ -521,7 +531,7 @@ class MultiTopology(BaseTopology):
         combined_group = None
         offset = 0
         for mol in self.mols:
-            constraint_group = get_hydrogen_bond_constraint_groups(mol)
+            constraint_group = get_hydrogen_bond_constraint_groups(mol, self.ff)
             if offset > 0:
                 constraint_group = replace(
                     constraint_group, groups=[[g + offset for g in group] for group in constraint_group.groups]

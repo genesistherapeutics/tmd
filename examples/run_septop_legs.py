@@ -1,4 +1,16 @@
 # (C) 2026 Justin Gullingsrud
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 import pickle
@@ -26,18 +38,12 @@ from tmd.fe.absolute.free_energy import RestraintParams
 from tmd.fe.free_energy import HREXParams, MDParams, compute_total_ns
 from tmd.fe.plots import plot_forward_and_reverse_dg
 from tmd.fe.rbfe import BATCH_MODE_ENV_VAR, DEFAULT_NUM_WINDOWS, HREXSimulationResult
-from tmd.fe.septop import SepTopResult, estimate_septop
+from tmd.fe.septop import COMPLEX_LEG, SOLVENT_LEG, colocate_central_atoms, run_septop
 from tmd.fe.utils import get_mol_name, read_sdf_mols_by_name
 from tmd.ff import Forcefield
 from tmd.md.builders import build_protein_system, build_water_system, compute_solvent_box_size, verify_pdb_structure
 from tmd.parallel.client import AbstractFileClient, CUDAPoolClient, FileClient, SerialClient
 from tmd.parallel.utils import get_gpu_count
-
-SOLVENT_LEG = "solvent"
-COMPLEX_LEG = "complex"
-
-# Map the leg name used on the command line to the SepTop phase argument.
-LEG_TO_PHASE = {SOLVENT_LEG: "aqueous", COMPLEX_LEG: "complex"}
 
 
 def run_septop_leg(
@@ -58,7 +64,7 @@ def run_septop_leg(
     enable_batching: bool,
     write_trajectories: bool,
     force_overwrite: bool,
-    water_box_size: float = 4.0,
+    solvent_padding: float = 1.0,
 ) -> dict[str, Any]:
     """Run a SepTop leg (solvent or complex).
 
@@ -107,16 +113,14 @@ def run_septop_leg(
         [w_lambda, 1.0].
     enable_batching : bool
         Batch the per-window MD during bisection. Enables batching for both the
-        non-HREX path (via ``estimate_septop``) and the HREX path (via the
+        non-HREX path (via ``run_septop``) and the HREX path (via the
         ``TMD_BATCH_MODE`` environment variable).
     write_trajectories : bool
         Whether to write out the endstate trajectories.
     force_overwrite : bool
         If results already exist, overwrite them; otherwise skip the leg.
-    water_box_size : float
-        Size of the water box for the solvent leg. Should be large enough to
-        avoid molecules interacting with copies of themselves across PBCs. Use
-        ``tmd.md.builders.compute_solvent_box_size`` to pick an appropriate size.
+    solvent_padding : float
+        Padding to add to solvent boxes.
 
     Returns
     -------
@@ -131,6 +135,11 @@ def run_septop_leg(
         print(f"Skipping existing leg {leg_name}: {get_mol_name(mol_a)} / {get_mol_name(mol_b)}")
         return dict(np.load(results_path))
 
+    if leg_name == SOLVENT_LEG:
+        # Superimpose ligands before generating solvent box.
+        mol_a, mol_b = Chem.Mol(mol_a), Chem.Mol(mol_b)
+        colocate_central_atoms(mol_a, mol_b)
+
     # Store top level data
     with open(file_client.full_path(edge_path / "md_params.pkl"), "wb") as ofs:
         pickle.dump(md_params, ofs)
@@ -141,14 +150,11 @@ def run_septop_leg(
         writer.write(mol_b)
 
     np.random.seed(md_params.seed)
-
-    # Batching in the HREX bisection path is controlled by an environment
-    # variable rather than a function argument, so set it here (inside the
-    # worker process) to enable batching throughout when requested.
     if enable_batching:
         os.environ[BATCH_MODE_ENV_VAR] = "on"
 
     if leg_name == SOLVENT_LEG:
+        water_box_size = compute_solvent_box_size([mol_a, mol_b], padding=solvent_padding)
         host_config = build_water_system(water_box_size, ff.water_ff, mols=[mol_a, mol_b])
     elif leg_name == COMPLEX_LEG:
         assert pdb_path is not None, "No pdb data provided"
@@ -161,7 +167,7 @@ def run_septop_leg(
     prefix = f"{leg_name}_{get_mol_name(mol_a)}_{get_mol_name(mol_b)}"
 
     start = time.perf_counter()
-    result: SepTopResult = estimate_septop(
+    res, crctns = run_septop(
         mol_a,
         mol_b,
         ff,
@@ -175,25 +181,22 @@ def run_septop_leg(
         eps_scale_lambda=eps_scale_lambda,
         w_lambda=w_lambda,
         enable_batching=enable_batching,
-        phase=LEG_TO_PHASE[leg_name],
+        leg=leg_name,
     )
     took = time.perf_counter() - start
-
-    res = result.sim_result
 
     # Raw dG is the sum of the per-window dGs. The complex leg additionally
     # carries the analytical Boresch restraint correction; the corrected leg dG
     # is raw - (correction_a - correction_b). The solvent leg correction is 0.
     raw_dg = float(np.sum(res.final_result.dGs))
-    correction = float(result.correction)
-    pred_dg = raw_dg - correction
+    pred_dg = raw_dg + crctns.correction
     pred_dg_err = float(np.linalg.norm(res.final_result.dG_errs))
     print(
         " | ".join(
             [
                 f"{get_mol_name(mol_a)} / {get_mol_name(mol_b)} (kJ/mol)",
                 f"{leg_name} {pred_dg:.2f} +- {pred_dg_err:.2f}",
-                f"correction {correction:.2f}",
+                f"correction {crctns.correction:.2f}",
                 f"{took:.0f} Seconds",
             ]
         ),
@@ -205,9 +208,9 @@ def run_septop_leg(
         "pred_dg": pred_dg,
         "pred_dg_err": pred_dg_err,
         "raw_dg": raw_dg,
-        "correction": correction,
-        "correction_a": result.correction_a,
-        "correction_b": result.correction_b,
+        "correction": crctns.correction,
+        "correction_a": crctns.correction_a,
+        "correction_b": crctns.correction_b,
         "overlaps": res.final_result.overlaps,
         "n_windows": len(res.final_result.initial_states),
     }
@@ -271,9 +274,9 @@ def main():
     parser.add_argument(
         "--n_gpus", default=None, type=int, help="Number of GPUs to use, defaults to all GPUs if not provided"
     )
-    parser.add_argument("--kb", default=500.0, type=float, help="Bond restraint force constant (kcal/mol/nm^2)")
-    parser.add_argument("--ka", default=200.0, type=float, help="Angle restraint force constant (kcal/mol/rad^2)")
-    parser.add_argument("--kd", default=10.0, type=float, help="Dihedral restraint force constant (kcal/mol)")
+    parser.add_argument("--kb", default=500.0, type=float, help="Bond restraint force constant (kJ/mol/nm^2)")
+    parser.add_argument("--ka", default=200.0, type=float, help="Angle restraint force constant (kJ/mol/rad^2)")
+    parser.add_argument("--kd", default=10.0, type=float, help="Dihedral restraint force constant (kJ/mol)")
     parser.add_argument(
         "--decharge_lambda",
         default=0.25,
@@ -321,10 +324,6 @@ def main():
 
     mol_a = mols_by_name[args.mol_a]
     mol_b = mols_by_name[args.mol_b]
-
-    water_box_size = 4.0
-    if SOLVENT_LEG in args.legs:
-        water_box_size = compute_solvent_box_size([mol_a, mol_b], padding=args.solvent_padding)
 
     output_dir = args.output_dir
     if output_dir is None:
@@ -382,7 +381,7 @@ def main():
             args.enable_batching,
             True,  # Always write out the trajectories
             args.force_overwrite,
-            water_box_size=water_box_size,
+            solvent_padding=args.solvent_padding,
         )
         futures.append(fut)
 

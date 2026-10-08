@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import warnings
+from collections import defaultdict
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from enum import IntEnum
@@ -48,7 +49,7 @@ from tmd.ff import Forcefield
 from tmd.graph_utils import convert_to_nx
 from tmd.lib import ConstraintGroups
 from tmd.md.builders import HostConfig
-from tmd.md.constraints.utils import get_hydrogen_bond_constraint_groups
+from tmd.md.constraints.utils import get_hydrogen_bond_constraint_groups, parameterize_harmonic_bonds
 from tmd.potentials import (
     BoundPotential,
     ChiralAtomRestraint,
@@ -144,6 +145,13 @@ DUMMY_A_TORSION_MIN_MAX = _flip_min_max(DUMMY_B_TORSION_MIN_MAX)
 #        |.......      \_______
 #  src   ----------------------
 #        0       lambda       1
+
+
+# Terminal atoms in the pairlist are scaled differently to handle ring breaking/forming cases where the
+# the terminal atoms can get too close and lead to instability.
+# Should be fully engaged after the bonded terms are fully applied
+DUMMY_A_NONBONDED_PAIRLIST_TERM_W_MIN_MAX = [1 / 4, 1]
+DUMMY_B_NONBONDED_PAIRLIST_TERM_W_MIN_MAX = _flip_min_max(DUMMY_A_NONBONDED_PAIRLIST_TERM_W_MIN_MAX)
 
 DUMMY_A_NONBONDED_W_MIN_MAX = [2 / 3, 1]
 DUMMY_B_NONBONDED_W_MIN_MAX = _flip_min_max(DUMMY_A_NONBONDED_W_MIN_MAX)
@@ -692,18 +700,19 @@ def setup_end_state(
     all_proper_dummy_chiral_atom_idxs_ = []
     all_proper_dummy_chiral_atom_params_ = []
 
+    chiral_center_missing_bonds = defaultdict(set)
     for (c, i, j, k), p in zip(all_dummy_chiral_atom_idxs, all_dummy_chiral_atom_params):
-        missing_bonds = []
         for x in [i, j, k]:
             if (c, x) not in mol_c_bond_idxs_set and (x, c) not in mol_c_bond_idxs_set:
-                missing_bonds.append((int(c), int(x)))
+                chiral_center_missing_bonds[c].add((int(c), int(x)))
 
-        if len(missing_bonds) == 0:
+    for (c, i, j, k), p in zip(all_dummy_chiral_atom_idxs, all_dummy_chiral_atom_params):
+        if c not in chiral_center_missing_bonds:
             all_proper_dummy_chiral_atom_idxs_.append((c, i, j, k))
             all_proper_dummy_chiral_atom_params_.append(p)
         else:
             warnings.warn(
-                f"Chiral Volume {int(c), int(i), int(j), int(k)} has disabled bonds {missing_bonds}, turning off.",
+                f"Chiral Volume {int(c), int(i), int(j), int(k)} has disabled bonds {list(chiral_center_missing_bonds[c])}, turning off.",
                 ChiralVolumeDisabledWarning,
             )
 
@@ -991,9 +1000,10 @@ batch_interpolate_chiral_atom_params = jax.jit(
 
 @jax.jit
 def batch_interpolate_nonbonded_pair_list_params(
-    cutoff,
+    cutoff: float,
     src_params,
     dst_params,
+    terminal_flags,
     lamb: float,
 ):
     """
@@ -1029,6 +1039,11 @@ def batch_interpolate_nonbonded_pair_list_params(
     # parameters for pairs that do not interact in the src state (dummy_B - core interaction, dummy_B - dummy_B interactions)
     # (these are pairs that are being turned on)
     w = interpolate.pad(interpolate_w_coord, cutoff, dst_w, lamb, *DUMMY_B_NONBONDED_W_MIN_MAX)
+    w = jnp.where(
+        terminal_flags,
+        interpolate.pad(interpolate_w_coord, cutoff, dst_w, lamb, *DUMMY_B_NONBONDED_PAIRLIST_TERM_W_MIN_MAX),
+        w,
+    )
     q = interpolate.pad(
         interpolate.linear_interpolation,
         jnp.zeros_like(dst_qlj[:, 0]),
@@ -1041,6 +1056,11 @@ def batch_interpolate_nonbonded_pair_list_params(
     # parameters for pairs that do not interact in the dst state (dummy_A - core interaction, dummy_A - dummy_A interactions)
     # (there are pairs that are being turned off)
     w = interpolate.pad(interpolate_w_coord, src_w, cutoff, lamb, *DUMMY_A_NONBONDED_W_MIN_MAX)
+    w = jnp.where(
+        terminal_flags,
+        interpolate.pad(interpolate_w_coord, src_w, cutoff, lamb, *DUMMY_A_NONBONDED_PAIRLIST_TERM_W_MIN_MAX),
+        w,
+    )
 
     q = interpolate.pad(
         interpolate.linear_interpolation,
@@ -1306,11 +1326,14 @@ class AlignedChiralAtom(AlignedPotential):
 @dataclass
 class AlignedNonbondedPairlist(AlignedPotential):
     cutoff: float
+    terminal_flags: NDArray[np.int32]
 
     def interpolate(self, lamb):
         # (ytz): batch_interpolate_nonbonded_pair_list_params currently fails to respect the self.mins and self.maxes
         # boundaries.
-        params = batch_interpolate_nonbonded_pair_list_params(self.cutoff, self.src_params, self.dst_params, lamb)
+        params = batch_interpolate_nonbonded_pair_list_params(
+            self.cutoff, self.src_params, self.dst_params, self.terminal_flags, lamb
+        )
         params = jnp.array(params)
         return NonbondedPairListPrecomputed(self.num_atoms, self.idxs, self.cutoff).bind(params)
 
@@ -1321,8 +1344,7 @@ def _hydrogen_bond_lengths(mol: Chem.Mol, ff: Forcefield) -> dict[int, float]:
     A hydrogen has exactly one bond, so its constrained distance is unambiguous.
     The returned dict maps each hydrogen's atom index to its bond length (nm).
     """
-    assert ff.hb_handle is not None
-    params, idxs = ff.hb_handle.partial_parameterize(ff.hb_handle.params, mol)
+    params, idxs = parameterize_harmonic_bonds(mol, ff)
     params = np.asarray(params)
     lengths: dict[int, float] = {}
     for (i, j), p in zip(idxs, params):
@@ -1342,16 +1364,26 @@ def filter_constraint_incompatible_hydrogens(
     ff: Forcefield,
     length_atol: float = DEFAULT_CONSTRAINT_LENGTH_ATOL,
 ) -> tuple[NDArray, list[tuple[int, int]]]:
-    """Drop hydrogen pairs from ``core`` whose constrained bond length differs
-    between the two molecules.
+    """Drop hydrogen pairs from ``core`` that are incompatible with rigid
+    hydrogen constraints.
 
     Hydrogen-involving bonds are rigidly constrained at a single, lambda-
     independent length, so a mapped hydrogen can only be constrained if its bond
-    length is the same in both end states. This catches transmutations of the
-    parent heavy atom (e.g. C->O) as well as same-element retypings (e.g. an
-    sp3->sp2 carbon) that change the X-H equilibrium length. Such hydrogens are
-    unmapped here so that single topology demotes them to per-state dummy atoms,
-    each retaining its own native (and therefore constraint-compatible) bond.
+    length is the same in both end states. Additionally the hydrogens off of a heavy atom
+    have to either be fully mapped or unmapped. Two checks are applied:
+
+    1. Any H-H pair whose constrained bond length differs between the two
+       molecules by more than ``length_atol`` is dropped. This catches
+       transmutations of the parent heavy atom (e.g. C->O) as well as
+       same-element retypings (e.g. an sp3->sp2 carbon) that change the X-H
+       equilibrium length.
+
+    2. For every mapped heavy atom ("anchor") that has at least one
+       H-H pair, if the number of hydrogens on that anchor differs between the
+       two molecules, or if any of its hydrogens are not present in ``core``,
+       then *all* core pairs involving the anchor's hydrogens (in either
+       molecule) are dropped. This ensures a heavy atom's hydrogen set is
+       either fully mapped or fully unmapped.
 
     Returns
     -------
@@ -1360,21 +1392,63 @@ def filter_constraint_incompatible_hydrogens(
         ``dropped_pairs`` lists the ``(a_idx, b_idx)`` pairs that were removed.
     """
     core = np.asarray(core)
+
     lengths_a = _hydrogen_bond_lengths(mol_a, ff)
     lengths_b = _hydrogen_bond_lengths(mol_b, ff)
 
-    keep_rows: list[tuple[int, int]] = []
-    dropped_pairs: list[tuple[int, int]] = []
-    for a, b in core:
+    def neighbors_by_atomic_num(atm, atomic_num: int) -> list:
+        return [a for a in atm.GetNeighbors() if a.GetAtomicNum() == atomic_num]
+
+    kept_idxs: list[int] = []
+    # Keep track of the hydrogen pairs that are kept
+    hydrogen_pairs: list[int] = []
+    for i, (a, b) in enumerate(core):
         a, b = int(a), int(b)
         a_is_h = mol_a.GetAtomWithIdx(a).GetAtomicNum() == 1
         b_is_h = mol_b.GetAtomWithIdx(b).GetAtomicNum() == 1
         if a_is_h and b_is_h and abs(lengths_a[a] - lengths_b[b]) > length_atol:
-            dropped_pairs.append((a, b))
             continue
-        keep_rows.append((a, b))
+        if a_is_h and b_is_h:
+            hydrogen_pairs.append(i)
+        kept_idxs.append(i)
 
-    filtered_core = np.array(keep_rows, dtype=core.dtype).reshape(-1, 2)
+    if len(hydrogen_pairs) > 0:
+        mixin = AtomMapMixin(mol_a, mol_b, core)
+
+        hydrogen_anchors = set()
+        for idx in hydrogen_pairs:
+            a, b = [int(x) for x in core[idx]]
+            for atm in mol_a.GetAtomWithIdx(a).GetNeighbors():
+                hydrogen_anchors.add(mixin.a_to_c[atm.GetIdx()])
+            for atm in mol_b.GetAtomWithIdx(b).GetNeighbors():
+                hydrogen_anchors.add(mixin.b_to_c[atm.GetIdx()])
+        keep_a = set([int(x[0]) for x in core])
+        keep_b = set([int(x[1]) for x in core])
+        pairs_to_prune: set[int] = set()
+        for anchor_idx in hydrogen_anchors:
+            hydrogens_a = set(
+                [atm.GetIdx() for atm in neighbors_by_atomic_num(mol_a.GetAtomWithIdx(mixin.c_to_a[anchor_idx]), 1)]
+            )
+            hydrogens_b = set(
+                [atm.GetIdx() for atm in neighbors_by_atomic_num(mol_b.GetAtomWithIdx(mixin.c_to_b[anchor_idx]), 1)]
+            )
+            remove_anchor_hs = True
+            if (
+                len(hydrogens_a) == len(hydrogens_b)
+                and keep_a.issuperset(hydrogens_a)
+                and keep_b.issuperset(hydrogens_b)
+            ):
+                remove_anchor_hs = False
+            if remove_anchor_hs:
+                for h in hydrogens_a:
+                    pairs_to_prune.update(np.arange(len(core))[core[:, 0] == h].tolist())
+                for h in hydrogens_b:
+                    pairs_to_prune.update(np.arange(len(core))[core[:, 1] == h].tolist())
+
+        kept_idxs = list(set(kept_idxs).difference(pairs_to_prune))
+
+    filtered_core = core[kept_idxs]
+    dropped_pairs = np.delete(core, kept_idxs, axis=0).tolist()
     return filtered_core, dropped_pairs
 
 
@@ -1542,7 +1616,20 @@ class SingleTopology(AtomMapMixin):
             self.src_system.nonbonded_pair_list,
             self.dst_system.nonbonded_pair_list,
         )
+
+        # Find all atoms that are terminal, to flag the pairs of interactions
+        # between terminal atoms to scale them at a different rate to other pairwise interactions.
+        terminal_atom_idxs = set()
+        for a in self.mol_a.GetAtoms():
+            if len(a.GetNeighbors()) == 1:
+                terminal_atom_idxs.add(self.a_to_c[a.GetIdx()])
+
+        for a in self.mol_b.GetAtoms():
+            if len(a.GetNeighbors()) == 1:
+                terminal_atom_idxs.add(self.b_to_c[a.GetIdx()])
+
         idxs = idxs.reshape(-1, 2)
+        terminal_flags = jnp.array([len(set(pair).intersection(terminal_atom_idxs)) == 2 for pair in idxs])
         src_params = src_params.reshape(-1, 4)
         dst_params = dst_params.reshape(-1, 4)
         return AlignedNonbondedPairlist(
@@ -1553,6 +1640,7 @@ class SingleTopology(AtomMapMixin):
             mins=mins,
             maxes=maxes,
             cutoff=src_cutoff,
+            terminal_flags=terminal_flags,
         )
 
     def combine_masses(self, use_hmr: bool = False) -> list[float]:
@@ -1578,14 +1666,11 @@ class SingleTopology(AtomMapMixin):
         # HMR value for dummy atoms
         if use_hmr:
             # Can't use src_system, dst_system as these have dummy atoms attached
-            mol_a_top = topology.BaseTopology(self.mol_a, self.ff)
-            mol_b_top = topology.BaseTopology(self.mol_b, self.ff)
-            assert self.ff.hb_handle is not None
-            _, mol_a_hb = mol_a_top.parameterize_harmonic_bond(self.ff.hb_handle.params)
-            _, mol_b_hb = mol_b_top.parameterize_harmonic_bond(self.ff.hb_handle.params)
+            _, mol_a_bond_idxs = parameterize_harmonic_bonds(self.mol_a, self.ff)
+            _, mol_b_bond_idxs = parameterize_harmonic_bonds(self.mol_b, self.ff)
 
-            mol_a_masses = model_utils.apply_hmr(mol_a_masses, mol_a_hb.idxs)
-            mol_b_masses = model_utils.apply_hmr(mol_b_masses, mol_b_hb.idxs)
+            mol_a_masses = model_utils.apply_hmr(mol_a_masses, mol_a_bond_idxs)
+            mol_b_masses = model_utils.apply_hmr(mol_b_masses, mol_b_bond_idxs)
 
         mol_c_masses = []
         for c_idx in range(self.get_num_atoms()):
@@ -1609,7 +1694,7 @@ class SingleTopology(AtomMapMixin):
         """Return the hydrogen-bond constraint groups for the combined topology."""
         verify_core_is_compatible_with_constraints(self.mol_a, self.mol_b, self.core, self.ff)
 
-        result_a = get_hydrogen_bond_constraint_groups(self.mol_a)
+        result_a = get_hydrogen_bond_constraint_groups(self.mol_a, self.ff)
         groups_a = result_a.groups
         dists_a = result_a.distances
         groups_c_anchor_to_groups = {
@@ -1617,7 +1702,7 @@ class SingleTopology(AtomMapMixin):
         }
         groups_c_anchor_to_dists = {self.a_to_c[group[0]]: dists for group, dists in zip(groups_a, dists_a)}
 
-        result_b = get_hydrogen_bond_constraint_groups(self.mol_b)
+        result_b = get_hydrogen_bond_constraint_groups(self.mol_b, self.ff)
         groups_b = result_b.groups
         dists_b = result_b.distances
         groups_b_anchor_to_hydrogens = {
@@ -2314,4 +2399,8 @@ class SingleTopology(AtomMapMixin):
                 potential=replace(guest_system.nonbonded_pair_list.potential, num_atoms=N),
             ),
             nonbonded_all_pairs=host_nonbonded_all_pairs,
+            positional_restraint=replace(
+                host_system.positional_restraint,
+                potential=replace(host_system.positional_restraint.potential, num_atoms=N),
+            ),
         )

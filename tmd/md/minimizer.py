@@ -136,6 +136,7 @@ def parameterize_system(topo, ff: Forcefield, lamb: float) -> tuple[list[Potenti
             ff_params.lj_params_intra,
             lamb,
         ),
+        topo.parameterize_positional_restraint(),
     ]
     return [pot for (_, pot) in params_potential_pairs], [params for (params, _) in params_potential_pairs]
 
@@ -851,6 +852,7 @@ def local_minimize(
     assert_energy_decreased: bool = True,
     restraint_k: float = 0.0,
     restrained_idxs: Optional[NDArray] = None,
+    force_threshold: float = MAX_FORCE_NORM,
 ) -> NDArray:
     """
     Minimize a local region given selected idxs.
@@ -886,6 +888,9 @@ def local_minimize(
 
     restrained_idxs: np.ndarray, optional
         A subset of idxs to restrain, must be a subset of local_idxs. If restrained_idxs is None, all local_idxs are restrained.
+
+    force_threshold: float
+        Maximum force norm that is considered to be minimized. Defaults to tmd.constants.MAX_FORCE_NORM
 
 
     Returns
@@ -970,7 +975,7 @@ def local_minimize(
             print("-" * 70)
 
         try:
-            check_force_norm(forces)
+            check_force_norm(forces, threshold=force_threshold)
 
             if assert_energy_decreased:
                 if not np.isnan(U_0) and U_final >= U_0:
