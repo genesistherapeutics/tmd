@@ -1692,7 +1692,7 @@ def test_local_md_setting_params_on_bp_potentials(freeze_reference, dt, num_syst
 
     ctxt = Context(coords_batch, v0_batch, box_batch, intg.impl(), bound_impls)
 
-    xs, boxes = ctxt.multiple_steps(2000)
+    xs, boxes = ctxt.multiple_steps(4000)
 
     # The initial forces should be reasonable
     du_dx, _ = bps[nb_pot_idx].to_gpu(np.float32).bound_impl.execute(xs[-1], boxes[-1], compute_u=False)
@@ -1997,6 +1997,48 @@ def test_unstable_simulation_failure():
         RuntimeError,
         match="simulation unstable: dimensions of coordinates two orders of magnitude larger than max box dimension",
     ):
+        ctxt.multiple_steps(steps)
+
+
+@pytest.mark.memcheck
+def test_non_finite_coordinates_simulation_failure():
+    mol, _ = get_biphenyl()
+    ff = Forcefield.load_from_file("smirnoff_2_0_0_sc.py")
+
+    temperature = constants.DEFAULT_TEMP
+    dt = 2.5e-3
+    friction = 1.0
+    seed = 2026
+    steps = 10
+
+    unbound_potentials, sys_params, masses, coords, host_config = get_solvent_phase_system(
+        mol, ff, 0.0, minimize_energy=False
+    )
+    box = host_config.box
+    v0 = np.zeros_like(coords)
+
+    bonded_pot = get_potential_by_type(unbound_potentials, HarmonicBond)
+    bond_list = get_bond_list(bonded_pot)
+    masses = apply_hmr(masses, bond_list)
+
+    bps = []
+    for p, pot in zip(sys_params, unbound_potentials):
+        bound_impl = pot.bind(p).to_gpu(np.float32).bound_impl
+        bps.append(bound_impl)
+
+    intg = LangevinIntegrator(temperature, dt, friction, masses, seed)
+
+    rng = np.random.default_rng(seed)
+
+    ctxt = Context(coords, v0, box, intg.impl(), bps)
+    # Run a few steps
+    ctxt.multiple_steps(steps)
+
+    random_inf_indice = rng.choice(np.arange(len(coords)))
+    partial_inf_coords = coords.copy()
+    partial_inf_coords[random_inf_indice] *= np.inf
+    ctxt.set_x_t(partial_inf_coords)
+    with pytest.raises(RuntimeError, match="simulation unstable: Coordinates contain non-finite numbers"):
         ctxt.multiple_steps(steps)
 
 

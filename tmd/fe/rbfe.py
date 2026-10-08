@@ -520,7 +520,49 @@ def optimize_coords_state(
     k: float,
     restrained_idxs: Optional[NDArray] = None,
     minimization_configs: Optional[Sequence[minimizer.MinimizationConfig]] = None,
+    force_threshold: float = 10_000.0,
 ) -> NDArray:
+    """
+    Minimize the coordinates of a single alchemical state.
+
+    Only the particles specified by free_idxs are allowed to move; all other particles are
+    held fixed. If provided, the atoms in restrained_idxs are subject to positional restraints
+    with force constant k.
+
+    Parameters
+    ----------
+    potentials: sequence of BoundPotential
+        Bound potentials defining the energy and gradient used for minimization
+
+    x0: array (N, 3)
+        Initial coordinates
+
+    box: array (3, 3)
+        Box vectors
+
+    free_idxs: list of int
+        Indices of the particles that are allowed to move during minimization
+
+    assert_energy_decreased: bool
+        Whether to assert that the energy decreases after minimization
+
+    k: float
+        Force constant of the positional restraints applied to restrained_idxs
+
+    restrained_idxs: array of int, optional
+        Indices of the atoms subject to positional restraints
+
+    minimization_configs: sequence of minimizer.MinimizationConfig, optional
+        Minimization protocols to run, in order. If not provided, default configs are used
+
+    force_threshold: float
+        The maximum force norm that will be tolerated for the final minimized coords
+
+    Returns
+    -------
+    array (N, 3)
+        Minimized coordinates
+    """
     val_and_grad_fn = minimizer.get_val_and_grad_fn(potentials, box)
     assert np.all(np.isfinite(x0)), "Initial coordinates contain nan or inf"
 
@@ -536,6 +578,7 @@ def optimize_coords_state(
         assert_energy_decreased=assert_energy_decreased,
         restrained_idxs=restrained_idxs,
         restraint_k=k,
+        force_threshold=force_threshold,
     )
     assert np.all(np.isfinite(x_opt)), "Minimization resulted in a nan"
     return x_opt
@@ -1482,10 +1525,9 @@ def run_solvent(
     solvent_host_config = builders.build_water_system(
         box_width, forcefield.water_ff, mols=[mol_a, mol_b], box_margin=0.1
     )
-    solvent_host_config = setup_optimized_host(solvent_host_config, [mol_a, mol_b], forcefield, seed=md_params.seed)
     # min_cutoff defaults to None since the original poses tend to come from posing in a complex and
     # in solvent the molecules may adopt significantly different poses
-    solvent_res = estimate_relative_free_energy_bisection_or_hrex(
+    return run_with_host_config(
         mol_a,
         mol_b,
         core,
@@ -1500,7 +1542,62 @@ def run_solvent(
         checkpoint_interval_frames=checkpoint_interval_frames,
         checkpoint_callback=checkpoint_callback,
     )
-    return solvent_res, solvent_host_config
+
+
+def run_with_host_config(
+    mol_a: Chem.rdchem.Mol,
+    mol_b: Chem.rdchem.Mol,
+    core: NDArray,
+    forcefield: Forcefield,
+    host_config: HostConfig,
+    prefix: str,
+    md_params: MDParams = DEFAULT_HREX_PARAMS,
+    n_windows: Optional[int] = None,
+    min_overlap: Optional[float] = None,
+    min_cutoff: Optional[float] = 0.7,
+    resume_state: HREXCheckpoint | None = None,
+    checkpoint_interval_frames: int | None = None,
+    checkpoint_callback: Callable[[HREXCheckpoint], None] | None = None,
+):
+    """Optimize a prebuilt host and run an RBFE leg.
+
+    Accepts a solvated host, such as one returned by
+    `builders.build_water_system`, with the alchemical ligands excluded.
+    Host coordinates must be aligned with both ligand poses. Host optimization
+    still runs before RBFE; the input host is not assumed to be equilibrated.
+
+    Parameters
+    ----------
+    prefix: str
+        Label used in output filenames and plots, such as "complex" or "solvent".
+
+    resume_state, checkpoint_interval_frames, checkpoint_callback
+        See :py:func:`estimate_relative_free_energy_bisection_or_hrex`.
+
+    Returns
+    -------
+    SimulationResult
+        Leg simulation results.
+    HostConfig
+        Optimized host configuration used for the simulation.
+    """
+    optimized_host_config = setup_optimized_host(host_config, [mol_a, mol_b], forcefield, seed=md_params.seed)
+    result = estimate_relative_free_energy_bisection_or_hrex(
+        mol_a,
+        mol_b,
+        core,
+        forcefield,
+        optimized_host_config,
+        prefix=prefix,
+        md_params=md_params,
+        n_windows=n_windows,
+        min_overlap=min_overlap,
+        min_cutoff=min_cutoff,
+        resume_state=resume_state,
+        checkpoint_interval_frames=checkpoint_interval_frames,
+        checkpoint_callback=checkpoint_callback,
+    )
+    return result, optimized_host_config
 
 
 def run_complex(
@@ -1526,8 +1623,7 @@ def run_complex(
         complex_host_config = builders.build_membrane_system(
             protein, forcefield.protein_ff, forcefield.water_ff, mols=[mol_a, mol_b], box_margin=0.1
         )
-    complex_host_config = setup_optimized_host(complex_host_config, [mol_a, mol_b], forcefield, seed=md_params.seed)
-    complex_res = estimate_relative_free_energy_bisection_or_hrex(
+    return run_with_host_config(
         mol_a,
         mol_b,
         core,
@@ -1542,4 +1638,3 @@ def run_complex(
         checkpoint_interval_frames=checkpoint_interval_frames,
         checkpoint_callback=checkpoint_callback,
     )
-    return complex_res, complex_host_config

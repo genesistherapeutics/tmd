@@ -108,7 +108,7 @@ if install_custom_ops():
 
 setup(
     name="tmd",
-    version="0.5.0",
+    version="0.5.3",
     cmdclass={"build_ext": CMakeBuild},
     description="A high-performance differentiable molecular dynamics and optimization engine",
     long_description=long_description,

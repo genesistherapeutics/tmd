@@ -73,6 +73,7 @@ from tmd.md.builders import _iterate_water_residues
 from tmd.md.hrex import HREX, HREXDiagnostics, ReplicaIdx
 from tmd.md.states import CoordsVelBox
 from tmd.potentials import (
+    FlatBottomRestraint,
     HarmonicAngle,
     HarmonicBond,
     Nonbonded,
@@ -275,6 +276,7 @@ def test_absolute_vacuum():
     assert np.all(masses == utils.get_mol_masses(mol))
     np.testing.assert_array_equal(afe.prepare_combined_coords(), utils.get_romol_conf(mol))
     assert set(type(pot) for pot in unbound_potentials) == {
+        FlatBottomRestraint,
         HarmonicBond,
         HarmonicAngle,
         PeriodicTorsion,
@@ -303,6 +305,7 @@ def test_absolute_solvent():
         np.testing.assert_array_equal(afe.prepare_combined_coords(), utils.get_romol_conf(mol))
 
         assert set(type(pot) for pot in unbound_potentials) == {
+            FlatBottomRestraint,
             HarmonicBond,
             HarmonicAngle,
             PeriodicTorsion,
@@ -647,14 +650,14 @@ def test_hrex_checkpoint_forced_stop_and_resume(hif2a_ligand_pair_single_topolog
     assert halfway_checkpoint.completed_frames == 2
     assert final_checkpoint.completed_frames == md_params.n_frames
     n_potentials = len(initial_states[0].potentials)
-    assert halfway_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, 2)
-    assert final_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, md_params.n_frames)
+    assert halfway_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, 4)
+    assert final_checkpoint.iterated_u_kln.shape == (n_potentials, 4, 4, 8)
     assert len(halfway_checkpoint.replica_idx_by_state_by_iter) == 4
     assert len(final_checkpoint.replica_idx_by_state_by_iter) == 8
     assert len(final_checkpoint.fraction_accepted_by_pair_by_iter) == 8
     assert len(final_checkpoint.water_sampler_proposals_by_state_by_iter) == 8
     np.testing.assert_equal(
-        final_checkpoint.iterated_u_kln[..., : halfway_checkpoint.completed_frames],
+        final_checkpoint.iterated_u_kln[..., :4],
         halfway_checkpoint.iterated_u_kln,
     )
     assert final_checkpoint.replica_idx_by_state_by_iter[:4] == halfway_checkpoint.replica_idx_by_state_by_iter
@@ -1023,8 +1026,8 @@ def test_get_context_with_non_contiguous_waters(neutralize, ionic_concentration)
     ctxt = get_context(state, md_params=md_params)
     movers = ctxt.get_movers()
     assert len(movers) == 2
-    assert isinstance(movers[0], custom_ops.MonteCarloBarostat_f32)
-    assert isinstance(movers[1], custom_ops.TIBDExchangeMove_f32)
+    assert isinstance(movers[0], custom_ops.TIBDExchangeMove_f32)
+    assert isinstance(movers[1], custom_ops.MonteCarloBarostat_f32)
 
 
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16])
@@ -1627,7 +1630,7 @@ def _make_valid_hrex_checkpoint(n_states=2, n_potentials=1, n_atoms=3, completed
     return HREXCheckpoint(
         completed_frames=completed_frames,
         hrex=HREX.from_replicas(replicas),
-        iterated_u_kln=np.zeros((n_potentials, n_states, n_states, completed_frames)),
+        iterated_u_kln=np.zeros((n_potentials, n_states, n_states, n_iterations)),
         replica_idx_by_state_by_iter=[list(permutation) for _ in range(n_iterations)],
         fraction_accepted_by_pair_by_iter=[[(0, 1)] * (n_states - 1) for _ in range(n_iterations)],
         water_sampler_proposals_by_state_by_iter=[[(0, 1)] * n_states for _ in range(n_iterations)],
