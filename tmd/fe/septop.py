@@ -1,4 +1,16 @@
 # (C) 2026 Justin Gullingsrud
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Separated topologies (SepTop) relative binding free energy.
 
@@ -7,20 +19,22 @@ Computes a relative binding free energy between two ligands ``mol_a`` and
 lambda coordinate, ``mol_a`` is decoupled as ``lambda`` goes 0 -> 1 while
 ``mol_b`` is simultaneously coupled (it follows ``1 - lambda``).
 
-Both legs are driven by :func:`estimate_septop` via its ``phase`` argument:
+Both legs are driven by :func:`run_septop` via its ``leg`` argument:
 
-* ``phase="complex"`` -- the two ligands share a single solvated receptor and
+* ``leg="complex"`` -- the two ligands share a single solvated receptor and
   each is held in place by Boresch-style restraints that turn on/off in
   opposite directions along lambda.
-* ``phase="aqueous"`` -- the two ligands share a single water box (no
+* ``leg="solvent"`` -- the two ligands share a single water box (no
   receptor). Instead of receptor restraints, one near-central atom is chosen
-  in each ligand (see :func:`select_central_atoms`) and a single constant
+  in each ligand (see :func:`select_central_atoms`), the two ligands are
+  translated so those atoms coincide (see :func:`colocate_central_atoms`,
+  which must be applied before the box is solvated), and a single constant
   zero-length harmonic bond is applied between them. The symmetric bond
   cancels between endpoints, so the solvent leg needs no standard-state
   correction.
 
 The relative binding free energy is then
-``ddG = dG_complex - dG_solvent - (corr_A - corr_B)``, where the per-ligand
+``ddG = dG_complex - dG_solvent + (corr_B - corr_A)``, where the per-ligand
 restraint corrections ``corr_A``/``corr_B`` come from the complex leg.
 
 References
@@ -36,7 +50,7 @@ This module deliberately re-implements pieces of
 ``tmd.fe.free_energy.AbsoluteFreeEnergy.prepare_host_edge`` and
 ``tmd.fe.absolute.abfe.get_initial_state`` so that we can apply the per-atom
 lambda transforms (decharge, epsilon scale, 4D W shift) to the two ligands
-independently. The TODOs flag what should eventually move upstream into tmd.
+independently.
 """
 
 from dataclasses import dataclass, replace
@@ -47,8 +61,8 @@ import numpy as np
 from numpy.typing import NDArray
 from rdkit import Chem
 
-from tmd.constants import DEFAULT_PRESSURE, DEFAULT_TEMP, NBParamIdx
-from tmd.fe import model_utils
+from tmd.constants import BOLTZ, DEFAULT_PRESSURE, DEFAULT_TEMP, NBParamIdx
+from tmd.fe import model_utils, topology
 from tmd.fe.absolute.abfe import (
     optimize_abfe_initial_state,
     sample_for_restraints,
@@ -61,7 +75,6 @@ from tmd.fe.absolute.restraints import (
 from tmd.fe.cif_writer import build_openmm_topology
 from tmd.fe.free_energy import (
     AbsoluteFreeEnergy,
-    HREXSimulationResult,
     InitialState,
     MDParams,
     SimulationResult,
@@ -81,24 +94,31 @@ from tmd.fe.rbfe import (
     setup_optimized_host,
 )
 from tmd.fe.topology import DualTopology
-from tmd.fe.utils import set_romol_conf
+from tmd.fe.utils import get_mol_masses, get_romol_conf, set_romol_conf
 from tmd.ff import Forcefield
 from tmd.lib import LangevinIntegrator, MonteCarloBarostat
 from tmd.md.barostat.utils import get_bond_list, get_group_indices
 from tmd.md.thermostat.utils import sample_velocities
 from tmd.potentials import HarmonicAngle, HarmonicBond, Nonbonded, PeriodicTorsion
+from tmd.potentials import HarmonicBond as _HarmonicBond
+from tmd.potentials.bonded import kahan_angle, signed_torsion_angle
+from tmd.potentials.jax_utils import delta_r
 from tmd.potentials.potential import get_potential_by_type
 
 __all__ = (
     "RestraintParams",
     "SepTopAnchors",
+    "SepTopCorrections",
     "SepTopFreeEnergy",
-    "SepTopResult",
-    "estimate_septop",
+    "colocate_central_atoms",
     "get_septop_initial_state",
+    "run_septop",
     "select_central_atoms",
     "select_septop_anchors",
 )
+
+SOLVENT_LEG = "solvent"
+COMPLEX_LEG = "complex"
 
 # Default schedule for the short equilibration used to select Boresch anchors.
 # This run only needs to relax the bound pose and yield ligand RMSF, so it is
@@ -121,21 +141,21 @@ class SepTopAnchors:
 
 
 @dataclass
-class SepTopResult:
-    """Result of a complex- or solvent-leg SepTop calculation."""
+class SepTopCorrections:
+    """Correction terms from SepTop restraints."""
 
-    sim_result: SimulationResult | HREXSimulationResult
     anchors: SepTopAnchors | None
     correction_a: float
     correction_b: float
 
+    @classmethod
+    def zero(cls):
+        return cls(None, 0, 0)
+
     @property
     def correction(self) -> float:
-        """Net restraint correction in kJ/mol.
-
-        ``ddG_complex_corrected = ddG_complex_raw - (correction_a - correction_b)``
-        """
-        return self.correction_a - self.correction_b
+        """Net restraint correction in kJ/mol."""
+        return self.correction_b - self.correction_a
 
 
 def select_septop_anchors(
@@ -193,13 +213,20 @@ def select_septop_anchors(
 
     # Receptor selection: use ligand A's atom indices in the joint frame; the
     # chosen receptor atoms apply to both ligands since they share the pocket.
-    rec_ids = select_receptor_atoms_baumann(full, [i + n_host for i in lig_ids_a_local])
+    rec_ids = select_receptor_atoms_baumann(full, [i + n_host for i in lig_ids_a_local], rmsf)
 
     return SepTopAnchors(
         rec_atoms=list(rec_ids),
         lig_atoms_a=[i + n_host for i in lig_ids_a_local],
         lig_atoms_b=[i + n_host + n_a for i in lig_ids_b_local],
     )
+
+
+def _central_atom_index(mol: Chem.Mol) -> int:
+    """Index of the atom closest to the ligand's geometric center."""
+    conf = get_romol_conf(mol)
+    center = conf.mean(axis=0)
+    return int(np.argmin(np.linalg.norm(conf - center, axis=1)))
 
 
 def select_central_atoms(
@@ -213,19 +240,26 @@ def select_central_atoms(
     returned indices are into the combined ``[host, mol_a, mol_b]`` ordering
     so they can be used directly as ``HarmonicBond`` atom indices.
     """
-    from tmd.fe.utils import get_romol_conf
 
     n_host = len(host_config.conf)
     n_a = mol_a.GetNumAtoms()
 
-    def _central_local(mol: Chem.Mol) -> int:
-        conf = get_romol_conf(mol)
-        center = conf.mean(axis=0)
-        return int(np.argmin(np.linalg.norm(conf - center, axis=1)))
-
-    central_a = n_host + _central_local(mol_a)
-    central_b = n_host + n_a + _central_local(mol_b)
+    central_a = n_host + _central_atom_index(mol_a)
+    central_b = n_host + n_a + _central_atom_index(mol_b)
     return central_a, central_b
+
+
+def colocate_central_atoms(mol_a: Chem.Mol, mol_b: Chem.Mol) -> None:
+    """Rigidly translate both ligands so their central atoms sit at the origin.
+
+    The solvent leg tethers the two ligands with a zero-length bond between the
+    atoms picked by :func:`select_central_atoms`; this function avoids a large
+    initial strain.  Must be called before the host is built, since solvation carves the
+    cavity around whatever poses it is given.
+    """
+    for mol in (mol_a, mol_b):
+        conf = get_romol_conf(mol)
+        set_romol_conf(mol, conf - conf[_central_atom_index(mol)])
 
 
 def _apply_lambda_transform_to_slice(
@@ -242,9 +276,6 @@ def _apply_lambda_transform_to_slice(
 
     Mirrors the per-ligand math in
     :py:meth:`tmd.fe.free_energy.AbsoluteFreeEnergy.prepare_host_edge`.
-
-    TODO: upstream into tmd as a public helper so SepTop can share the
-    implementation rather than duplicating it.
     """
     if lamb <= 0.0:
         return nb_params
@@ -336,7 +367,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
     # ---- coordinates ----
     def prepare_combined_coords(self, host_coords: NDArray | None = None) -> NDArray:
         """Concatenate ``[host, mol_a, mol_b]`` coordinates."""
-        from tmd.fe.utils import get_romol_conf
 
         a_coords = get_romol_conf(self.mol_a)
         b_coords = get_romol_conf(self.mol_b)
@@ -362,8 +392,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
         restraints, if configured via ``self.anchors`` and ``self.rst_params``,
         are appended.
         """
-        from tmd.fe import topology
-        from tmd.fe.utils import get_mol_masses
 
         ff_params = ff.get_params()
         hgt = topology.HostGuestTopology(
@@ -451,8 +479,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
         (a decoupled ligand would feel no host forces and drift away), so a
         single joint trajectory yields realistic RMSF for both ligands.
         """
-        from tmd.fe import topology
-        from tmd.fe.utils import get_mol_masses
 
         ff_params = ff.get_params()
         hgt = topology.HostGuestTopology(
@@ -475,8 +501,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
     # one ligand only. Instead we replicate just the geometry math here using
     # the combined ``self.x0`` / ``self.box0``.
     def _bond_geometry(self, lig_atoms: list[int]) -> tuple[list[int], float]:
-        from tmd.potentials.jax_utils import delta_r
-
         assert self.anchors is not None and self.x0 is not None
         i0 = [self.anchors.rec_atoms[0], lig_atoms[0]]
         a0, b0 = self.x0[i0]
@@ -484,8 +508,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
         return i0, r0
 
     def _angle_geometry(self, lig_atoms: list[int]) -> list[tuple[list[int], float]]:
-        from tmd.potentials.bonded import kahan_angle
-
         assert self.anchors is not None and self.x0 is not None
         rec = self.anchors.rec_atoms
         i0 = [rec[1], rec[0], lig_atoms[0]]
@@ -497,8 +519,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
         return [(i0, t0), (i1, t1)]
 
     def _dihedral_geometry(self, lig_atoms: list[int]) -> list[tuple[list[int], float]]:
-        from tmd.potentials.bonded import signed_torsion_angle
-
         assert self.anchors is not None and self.x0 is not None
         rec = self.anchors.rec_atoms
         i0 = [rec[2], rec[1], rec[0], lig_atoms[0]]
@@ -578,7 +598,6 @@ class SepTopFreeEnergy(AbsoluteFreeEnergy):
         Uses the same formula as
         :meth:`AbsoluteBindingFreeEnergy.get_restraint_correction`.
         """
-        from tmd.constants import BOLTZ
 
         assert self.rst_params is not None
         _, r0 = self._bond_geometry(lig_atoms)
@@ -611,7 +630,6 @@ def get_septop_initial_state(
     ligand index ranges and chooses ``interacting_atoms`` based on which
     ligand is fully coupled at the endpoint (A at lamb=0, B at lamb=1).
     """
-    from tmd.potentials import HarmonicBond as _HarmonicBond
 
     ubps, params, masses = afe.prepare_host_edge(ff, host_config, lamb)
     x0 = afe.prepare_combined_coords(host_coords=host_conf)
@@ -679,7 +697,6 @@ def get_septop_equilibration_state(
     fully coupled (and mutually non-interacting) with no restraints. Used to
     equilibrate the bound complex before anchor selection.
     """
-    from tmd.potentials import HarmonicBond as _HarmonicBond
 
     ubps, params, masses = afe.prepare_equilibration_edge(ff, host_config)
     x0 = afe.prepare_combined_coords(host_coords=host_conf)
@@ -755,7 +772,7 @@ def _equilibrate_joint(
     return trj
 
 
-def estimate_septop(
+def run_septop(
     mol_a: Chem.Mol,
     mol_b: Chem.Mol,
     ff: Forcefield,
@@ -770,8 +787,8 @@ def estimate_septop(
     eps_scale_lambda: float = 0.25,
     w_lambda: float = 0.5,
     enable_batching: bool = False,
-    phase: str = "complex",
-) -> SepTopResult:
+    leg: str = COMPLEX_LEG,
+) -> tuple[SimulationResult, SepTopCorrections]:
     """Run one leg of a SepTop calculation.
 
     Mirrors the structure of the ABFE estimator:
@@ -781,23 +798,21 @@ def estimate_septop(
 
     Parameters
     ----------
-    phase
+    leg
         ``"complex"`` (default) runs the receptor-bound leg with per-ligand
         Boresch restraints and returns the analytical restraint corrections.
-        ``"aqueous"`` runs the solvent leg: the two ligands share a water box
+        ``"solvent"`` runs the solvent leg: the two ligands share a water box
         and are tethered by a single zero-length bond between their central
-        atoms, so no anchors are picked and the corrections are zero.
+        atoms.  The caller must have already superimposed those atoms with
+        :func:`colocate_central_atoms` *before* building ``host_config``,
+        since the water box is carved around the poses it is given.
 
     Returns
     -------
-    SepTopResult
-        Wraps the underlying :class:`SimulationResult` /
-        :class:`HREXSimulationResult`. For the complex leg it also carries the
-        chosen anchors and per-ligand analytical restraint corrections; for the
-        solvent leg ``anchors`` is ``None`` and the corrections are ``0``.
+    SimulationResult, SepTopCorrections
     """
-    if phase not in ("complex", "aqueous"):
-        raise ValueError(f"unsupported SepTop phase: {phase!r}")
+    if leg not in (COMPLEX_LEG, SOLVENT_LEG):
+        raise ValueError(f"unsupported SepTop leg: {leg!r}")
 
     # Build the per-ligand decoupling intervals from the scalar knobs: decharge
     # over the symmetric ``[decharge_lambda, 1 - decharge_lambda]``, epsilon
@@ -821,7 +836,7 @@ def estimate_septop(
     temperature = DEFAULT_TEMP
 
     anchors: SepTopAnchors | None
-    if phase == "complex":
+    if leg == COMPLEX_LEG:
         afe, host_config, host_conf_eq, anchors = _setup_complex_leg(
             mol_a,
             mol_b,
@@ -899,22 +914,14 @@ def estimate_septop(
         )
 
     if anchors is None:
-        return SepTopResult(
-            sim_result=sim_result,
-            anchors=None,
-            correction_a=0.0,
-            correction_b=0.0,
+        corrections = SepTopCorrections.zero()
+    else:
+        corrections = SepTopCorrections(
+            anchors=anchors,
+            correction_a=float(afe.get_restraint_correction(anchors.lig_atoms_a, temperature)),
+            correction_b=float(afe.get_restraint_correction(anchors.lig_atoms_b, temperature)),
         )
-
-    correction_a = float(afe.get_restraint_correction(anchors.lig_atoms_a, temperature))
-    correction_b = float(afe.get_restraint_correction(anchors.lig_atoms_b, temperature))
-
-    return SepTopResult(
-        sim_result=sim_result,
-        anchors=anchors,
-        correction_a=correction_a,
-        correction_b=correction_b,
-    )
+    return sim_result, corrections
 
 
 def _setup_complex_leg(
@@ -974,8 +981,12 @@ def _setup_solvent_leg(
     eps_scale_interval: tuple[float, float] = (0.2, 0.4),
     w_interval: tuple[float, float] = (0.0, 1.0),
 ) -> tuple[SepTopFreeEnergy, HostConfig, NDArray, None]:
-    """Build the dual-ligand solvent-leg system (no anchors, central bond)."""
-    from tmd.fe.utils import get_romol_conf
+    """Build the dual-ligand solvent-leg system (no anchors, central bond).
+
+    Assumes the ligands have already been superimposed on their central atoms
+    by :func:`colocate_central_atoms`, so the zero-length tether starts
+    unstrained.
+    """
 
     host_conf = host_config.conf
     box = host_config.box

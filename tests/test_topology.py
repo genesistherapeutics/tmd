@@ -20,7 +20,7 @@ from typing import no_type_check
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from common import check_split_ixns
+from common import check_split_ixns, ligand_from_smiles
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
@@ -89,6 +89,20 @@ def test_base_topology_get_constraint_groups():
             assert np.all(np.array(dist) > 0)
             assert mol.GetAtomWithIdx(group[0]).GetAtomicNum() > 1
             assert all([mol.GetAtomWithIdx(idx).GetAtomicNum() == 1 for idx in group[1:]])
+
+
+@pytest.mark.nocuda
+def test_constraint_group_distances_are_independent_of_conformer():
+    mol = ligand_from_smiles("O")
+    ff = Forcefield.load_from_file("smirnoff_2_0_0_sc.py")
+    expected = BaseTopology(mol, ff).get_constraint_groups().distances
+
+    coords = get_romol_conf(mol)
+    coords[1] += 0.1
+    set_romol_conf(mol, coords)
+
+    actual = BaseTopology(mol, ff).get_constraint_groups().distances
+    assert actual == expected
 
 
 @pytest.mark.nocuda

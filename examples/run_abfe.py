@@ -27,6 +27,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 
+import mdtraj as md
 import numpy as np
 from rdkit import Chem
 
@@ -66,7 +67,7 @@ from tmd.fe.rbfe import (
     setup_optimized_host,
 )
 from tmd.fe.topology import BaseTopology
-from tmd.fe.utils import get_mol_experimental_value, get_mol_name, read_sdf_mols_by_name, set_romol_conf
+from tmd.fe.utils import get_mol_experimental_value, get_mol_name, read_sdf_mols_by_name, set_romol_conf, verify_mol
 from tmd.ff import Forcefield
 from tmd.md.builders import build_membrane_system, build_protein_system, build_water_system
 from tmd.md.exchange.utils import get_radius_of_mol_pair
@@ -77,6 +78,7 @@ from tmd.parallel.client import (
     iterate_completed_futures,
 )
 from tmd.parallel.utils import get_gpu_count
+from tmd.potentials import FlatBottomRestraint
 
 
 def write_result_csv(
@@ -254,6 +256,7 @@ def run_abfe(
     write_trajectories: bool,
     force_overwrite: bool,
     add_membrane: bool,
+    restraint_selection: str | None = None,
 ) -> dict[str, Any]:
     """Run an ABFE calculation.
 
@@ -298,6 +301,9 @@ def run_abfe(
         If results already exist, overwrite the results
     add_membrane: bool
         Build the protein with a POPC membrane
+    restraint_selection: str or None
+        MDTraj selection of complex host atoms to restrain to their initial positions.
+        Uses a 0.05 nm flat-bottom radius and k=10000 kJ/mol/nm^4.
 
     Returns
     -------
@@ -329,6 +335,15 @@ def run_abfe(
             host_config = build_protein_system(pdb_path, ff.protein_ff, ff.water_ff, mols=[mol], box_margin=0.1)
         else:
             host_config = build_membrane_system(pdb_path, ff.protein_ff, ff.water_ff, mols=[mol], box_margin=0.1)
+        if restraint_selection is not None:
+            restraint_idxs = (
+                md.Topology.from_openmm(host_config.omm_topology).select(restraint_selection).astype(np.int32)
+            )
+            if len(restraint_idxs) == 0:
+                raise ValueError(f"Restraint selection matched no host atoms: {restraint_selection!r}")
+            host_config.host_system.positional_restraint = FlatBottomRestraint(
+                len(host_config.conf), restraint_idxs, host_config.conf[restraint_idxs].copy()
+            ).bind(np.tile([10_000.0, 0.0, 0.05], (len(restraint_idxs), 1)))
     else:
         host_config = build_water_system(4.0, ff.water_ff, mols=[mol], box_margin=0.1)
     # TBD: Expose restraint params?
@@ -405,6 +420,10 @@ def main():
     parser = ArgumentParser(description="Run ABFE for a set of compounds")
     parser.add_argument("--sdf_path", help="Path to sdf file containing mols", required=True)
     parser.add_argument("--pdb_path", help="Path to pdb file containing structure")
+    parser.add_argument(
+        "--restraint_selection",
+        help="MDTraj selection of complex host atoms for flat-bottom position restraints, e.g. 'protein and name CA' (radius 0.05 nm, k=10000 kJ/mol/nm^4).",
+    )
     parser.add_argument("--mps_workers", type=int, default=1, help="Number of MPS processes per GPU")
     parser.add_argument("--n_eq_steps", default=200_000, type=int, help="Number of steps to perform equilibration")
     parser.add_argument("--n_frames", default=2000, type=int, help="Number of frames to generation")
@@ -484,6 +503,9 @@ def main():
     mols_by_name = read_sdf_mols_by_name(args.sdf_path)
     np.random.seed(args.seed)
 
+    for mol in mols_by_name.values():
+        verify_mol(mol)
+
     assert args.dt_fs > 0.0
     dt = args.dt_fs * 1e-3
 
@@ -562,6 +584,7 @@ def main():
                 args.store_trajectories,
                 args.force_overwrite,
                 args.add_membrane,
+                restraint_selection=args.restraint_selection,
             )
             future_id_to_leg[fut.id] = (name, leg)
             futures.append(fut)

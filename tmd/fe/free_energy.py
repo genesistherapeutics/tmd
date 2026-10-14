@@ -54,6 +54,7 @@ from tmd.lib import ConstrainedLangevinIntegrator, ConstraintGroups, LangevinInt
 from tmd.lib.custom_ops import BoundPotential_f32, Context_f32, SummedPotential_f32
 from tmd.md.barostat.utils import compute_box_center, get_bond_list, get_group_indices
 from tmd.md.builders import HostConfig
+from tmd.md.constraints.utils import prune_constrained_valence_terms
 from tmd.md.exchange.exchange_mover import WaterSamplingDiagnostics, get_water_idxs
 from tmd.md.hrex import HREX, HREXDiagnostics, ReplicaIdx, StateIdx, get_swap_attempts_per_iter_heuristic
 from tmd.md.states import CoordsVelBox
@@ -283,15 +284,17 @@ class HREXCheckpoint:
         if sorted(self.hrex.replica_idx_by_state) != expected_permutation:
             raise ValueError("HREX checkpoint current replica permutation is invalid")
 
+        n_completed_iterations = self.completed_frames * md_params.hrex_params.iterations_per_frame
+
         if self.iterated_u_kln is None:
             raise ValueError("HREX checkpoint has completed_frames set but no iterated_u_kln")
-        expected_u_kln_shape = (n_potentials, n_states, n_states, self.completed_frames)
+        # One u_kln sample per HREX iteration, not per frame
+        expected_u_kln_shape = (n_potentials, n_states, n_states, n_completed_iterations)
         if self.iterated_u_kln.shape != expected_u_kln_shape:
             raise ValueError(
                 f"HREX checkpoint iterated_u_kln has shape {self.iterated_u_kln.shape}, expected {expected_u_kln_shape}"
             )
 
-        n_completed_iterations = self.completed_frames * md_params.hrex_params.iterations_per_frame
         if len(self.replica_idx_by_state_by_iter) != n_completed_iterations or any(
             sorted(permutation) != expected_permutation for permutation in self.replica_idx_by_state_by_iter
         ):
@@ -658,6 +661,7 @@ class BaseFreeEnergy:
                 ff_params.lj_params_intra,
                 lamb,
             ),
+            topology.parameterize_positional_restraint(),
         ]
 
         params, potentials = zip(*params_potential_pairs)
@@ -875,17 +879,10 @@ def get_summed_potential_from_bps(bps: Sequence[BoundPotential_f32]) -> SummedPo
 
 
 def get_batched_context(initial_states: Sequence[InitialState], md_params: Optional[MDParams] = None) -> Context_f32:
+    assert len(initial_states) > 1
+
     for s in initial_states[1:]:
         assert_ensembles_compatible(initial_states[0], s)
-
-    assert len(initial_states) > 1
-    bps = [bp for bp in initial_states[0].potentials]
-    for state in initial_states[1:]:
-        for i, pot in enumerate(state.potentials):
-            combined_pot = bps[i].combine(pot)
-            bps[i] = combined_pot
-
-    bound_impls = [bp.to_gpu(np.float32).bound_impl for bp in bps]
 
     intg = initial_states[0].integrator
     assert isinstance(intg, (LangevinIntegrator, ConstrainedLangevinIntegrator))
@@ -910,9 +907,6 @@ def get_batched_context(initial_states: Sequence[InitialState], md_params: Optio
         raise TypeError(f"Unknown integrator type: {type(intg)}")
     intg_impl = intg.impl(np.float32)
     movers = []
-    if initial_states[0].barostat is not None:
-        # Requires that the barostat is consistent across states
-        movers.append(initial_states[0].barostat.impl(bound_impls))
 
     if md_params is not None and md_params.water_sampling_params is not None:
         hb_potential = get_bound_potential_by_type(initial_states[0].potentials, HarmonicBond).potential
@@ -945,6 +939,20 @@ def get_batched_context(initial_states: Sequence[InitialState], md_params: Optio
         )
         movers.append(water_sampler)
 
+    bps = [bp for bp in initial_states[0].potentials]
+    for state in initial_states[1:]:
+        for i, pot in enumerate(state.potentials):
+            combined_pot = bps[i].combine(pot)
+            bps[i] = combined_pot
+
+    if isinstance(initial_states[0].integrator, ConstrainedLangevinIntegrator):
+        bps = prune_constrained_valence_terms(bps, initial_states[0].integrator.constraints)
+
+    bound_impls = [bp.to_gpu(np.float32).bound_impl for bp in bps]
+    if initial_states[0].barostat is not None:
+        # Requires that the barostat is consistent across states
+        movers.append(initial_states[0].barostat.impl(bound_impls))
+
     return Context_f32(
         np.stack([state.x0 for state in initial_states]),
         np.stack([state.v0 for state in initial_states]),
@@ -960,20 +968,18 @@ def get_context(initial_state: InitialState, md_params: Optional[MDParams] = Non
     Construct a Context from the potentials defined by the initial state
     """
 
-    bound_impls = [bp.to_gpu(np.float32).bound_impl for bp in initial_state.potentials]
+    potentials = initial_state.potentials
     intg_impl = initial_state.integrator.impl()
     movers = []
-    if initial_state.barostat:
-        movers.append(initial_state.barostat.impl(bound_impls))
     if md_params is not None and md_params.water_sampling_params is not None:
         # Setup the water indices
-        hb_potential = get_bound_potential_by_type(initial_state.potentials, HarmonicBond).potential
+        hb_potential = get_bound_potential_by_type(potentials, HarmonicBond).potential
         group_indices = get_group_indices(get_bond_list(hb_potential), len(initial_state.integrator.masses))
 
         water_idxs = get_water_idxs(group_indices, ligand_idxs=initial_state.ligand_idxs)
 
         # Select a Nonbonded Potential to get the the cutoff, assumes all have same cutoff.
-        nb = get_bound_potential_by_type(initial_state.potentials, Nonbonded).potential
+        nb = get_bound_potential_by_type(potentials, Nonbonded).potential
 
         water_params = get_water_sampler_params(initial_state)
 
@@ -995,6 +1001,13 @@ def get_context(initial_state: InitialState, md_params: Optional[MDParams] = Non
             batch_size=md_params.water_sampling_params.batch_size,
         )
         movers.append(water_sampler)
+
+    if isinstance(initial_state.integrator, ConstrainedLangevinIntegrator):
+        potentials = prune_constrained_valence_terms(potentials, initial_state.integrator.constraints)
+    bound_impls = [bp.to_gpu(np.float32).bound_impl for bp in potentials]
+
+    if initial_state.barostat:
+        movers.append(initial_state.barostat.impl(bound_impls))
 
     return Context_f32(initial_state.x0, initial_state.v0, initial_state.box0, intg_impl, bound_impls, movers=movers)
 
@@ -1405,6 +1418,8 @@ def _run_sequential_bisection(
     assert len(bound_potentials) == len(get_initial_state(lambdas[0]).potentials)
     unbound_impls = [bp.get_potential() for bp in bound_potentials]
 
+    applies_constraints = isinstance(get_initial_state(lambdas[0]).integrator, ConstrainedLangevinIntegrator)
+
     @cache
     def get_samples(lamb: float) -> Trajectory:
         initial_state = get_initial_state(lamb)
@@ -1412,6 +1427,11 @@ def _run_sequential_bisection(
         context.set_v_t(initial_state.v0)
         context.set_box(initial_state.box0)
         for bp, state_bp in zip(bound_potentials, initial_state.potentials):
+            if applies_constraints:
+                state_bp = prune_constrained_valence_terms(
+                    [state_bp],
+                    initial_state.integrator.constraints,  # type: ignore
+                )[0]
             bp.set_params(state_bp.params)  # type: ignore
         for mover in context.get_movers():
             mover.set_step(0)
@@ -1561,7 +1581,9 @@ def _run_batched_bisection(
     assert np.all(np.diff(initial_lambdas) > 0), "initial lambda schedule must be monotonically increasing"
     if len(initial_lambdas) > batch_size:
         raise RuntimeError("Batched Bisection doesn't support more initial lambdas than batch size")
+
     get_initial_state = cache(make_initial_state)
+
     rng = np.random.default_rng(md_params.seed)
 
     if len(initial_lambdas) == 2:
@@ -1592,18 +1614,20 @@ def _run_batched_bisection(
     bound_potentials = context.get_potentials()
     assert len(bound_potentials) == len(get_initial_state(lambdas[0]).potentials)
 
-    temp_ctxt = get_context(get_initial_state(initial_lambdas[0]))
+    temp_ctxt = get_context(get_initial_state(lambdas[0]))
     nrg_pots = [bp.get_potential() for bp in temp_ctxt.get_potentials()]
     del temp_ctxt
 
     barostat = context.get_barostat()
 
-    first_state = get_initial_state(initial_lambdas[0])
+    first_state = get_initial_state(lambdas[0])
     initial_volume_scale_factor = 0.0
     ligand_idxs = first_state.ligand_idxs
     if barostat is not None:
         assert first_state.barostat is not None
         initial_volume_scale_factor = first_state.barostat.initial_volume_scale_factor or 0.0
+
+    applies_constraints = isinstance(first_state.integrator, ConstrainedLangevinIntegrator)
 
     trajs_by_lamb = {}
 
@@ -1614,7 +1638,14 @@ def _run_batched_bisection(
             context.set_v_t(np.stack([state.v0 for state in states]))
             context.set_box(np.stack([state.box0 for state in states]))
             for i, bp in enumerate(bound_potentials):
-                bp.set_params(np.stack([state.potentials[i].params for state in states]))
+                if not applies_constraints:
+                    bp.set_params(np.stack([state.potentials[i].params for state in states]))
+                else:
+                    pots = prune_constrained_valence_terms(
+                        [state.potentials[i] for state in states],
+                        first_state.integrator.constraints,  # type: ignore
+                    )
+                    bp.set_params(np.stack([pot.params for pot in pots]))
             for mover in context.get_movers():
                 mover.set_step(0)
                 if isinstance(mover, WATER_SAMPLER_MOVERS):
@@ -2102,8 +2133,8 @@ def compute_u_kln(trajs: Sequence[Trajectory], initial_states: Sequence[InitialS
         assert_ensembles_compatible(initial_states[0], s)
 
     N_k = np.array([len(traj.frames) for traj in trajs], dtype=np.int32)
-    kBTs = [BOLTZ * state.integrator.temperature for state in initial_states]
-    assert len(set(kBTs)) == 1
+    inv_kBTs = [1 / (BOLTZ * state.integrator.temperature) for state in initial_states]
+    assert len(set(inv_kBTs)) == 1
     summed_pot = make_summed_potential(initial_states[0].potentials)
     K = len(initial_states)
     P = len(summed_pot.params)
@@ -2123,7 +2154,7 @@ def compute_u_kln(trajs: Sequence[Trajectory], initial_states: Sequence[InitialS
             traj.frames, all_params, traj.boxes, compute_du_dx=False, compute_du_dp=False, compute_u=True
         )
         Us = Us.T  # Transpose to get energies by params
-        us = Us.reshape(K, N_k[i]) / kBTs[i]
+        us = Us.reshape(K, N_k[i]) * inv_kBTs[i]
         u_kln[i, :, : N_k[i]] = np.nan_to_num(us, nan=+np.inf)
     return u_kln, N_k
 
@@ -2160,15 +2191,24 @@ def generate_pair_bar_ulkns(
     num_samples = len(samples_by_state[0].boxes)
     assert all([len(traj.boxes) == num_samples for traj in samples_by_state])
     if unbound_impls is None:
-        unbound_impls = [pot.potential.to_gpu(np.float32).unbound_impl for pot in initial_states[0].potentials]
+        pots = initial_states[0].potentials
+        if isinstance(initial_states[0].integrator, ConstrainedLangevinIntegrator):
+            pots = prune_constrained_valence_terms(pots, initial_states[0].integrator.constraints)
+        unbound_impls = [pot.potential.to_gpu(np.float32).unbound_impl for pot in pots]
     assert len(unbound_impls) == len(initial_states[0].potentials)
     kBT = temperature * BOLTZ
     # Construct an empty array
     energies_by_frames_by_params = np.zeros(
         (len(initial_states), len(initial_states), len(unbound_impls)), dtype=object
     )
-    params_by_state = [[bp.params for bp in initial_state.potentials] for initial_state in initial_states]
+    params_by_state = []
+    for initial_state in initial_states:
+        pots = initial_state.potentials
+        if isinstance(initial_state.integrator, ConstrainedLangevinIntegrator):
+            pots = prune_constrained_valence_terms(pots, initial_state.integrator.constraints)
+        params_by_state.append([bp.params for bp in pots])
     executor = custom_ops.PotentialExecutor_f32()
+    inv_kbt = 1 / kBT
     for i, state in enumerate(initial_states):
         frames = np.array(samples_by_state[i].frames)
         boxes = np.asarray(samples_by_state[i].boxes)
@@ -2190,7 +2230,7 @@ def generate_pair_bar_ulkns(
             compute_du_dp=False,
             compute_u=True,
         )
-        us = Us / kBT
+        us = Us * inv_kbt
         for j in range(len(unbound_impls)):
             # Transpose to get energies by params
             per_pot_us = us[j].T
@@ -2503,7 +2543,10 @@ def run_sims_hrex_iter(
     ligand_idxs = initial_states[0].ligand_idxs
 
     def get_state_params(initial_state: InitialState) -> list[NDArray]:
-        return [bp.params for bp in initial_state.potentials]
+        potentials = initial_state.potentials
+        if isinstance(initial_state.integrator, ConstrainedLangevinIntegrator):
+            potentials = prune_constrained_valence_terms(potentials, initial_state.integrator.constraints)
+        return [bp.params for bp in potentials]
 
     params_by_state = [get_state_params(initial_state) for initial_state in initial_states]
 
@@ -2524,8 +2567,14 @@ def run_sims_hrex_iter(
 
     samples_by_state: list[Trajectory] = [Trajectory.empty() for _ in initial_states]
 
+    iters_per_frame = md_params.hrex_params.iterations_per_frame
     iterated_u_kln = np.full(
-        (len(initial_states[0].potentials), len(initial_states), len(initial_states), md_params.n_frames),
+        (
+            len(initial_states[0].potentials),
+            len(initial_states),
+            len(initial_states),
+            md_params.n_frames * iters_per_frame,
+        ),
         np.inf,
         dtype=np.float32,
     )
@@ -2541,7 +2590,7 @@ def run_sims_hrex_iter(
         assert resume_state.hrex is not None
         assert resume_state.iterated_u_kln is not None
         hrex = resume_state.hrex
-        iterated_u_kln[..., :completed_frames] = resume_state.iterated_u_kln
+        iterated_u_kln[..., : completed_frames * iters_per_frame] = resume_state.iterated_u_kln
         replica_idx_by_state_by_iter = [list(permutation) for permutation in resume_state.replica_idx_by_state_by_iter]
         water_sampler_proposals_by_state_by_iter = [
             list(counts_by_state) for counts_by_state in resume_state.water_sampler_proposals_by_state_by_iter
@@ -2570,7 +2619,8 @@ def run_sims_hrex_iter(
 
     hrex_func = run_sequential_hrex_step if not batch_simulations else run_batched_hrex_step
 
-    iters_per_frame = md_params.hrex_params.iterations_per_frame
+    inv_kbt = 1 / kBT
+
     for current_frame in range(completed_frames, md_params.n_frames):
         for i in range(iters_per_frame):
             hrex, samples_by_state_iter, U_kl_raw, water_sampler_proposals_by_state = hrex_func(
@@ -2590,7 +2640,13 @@ def run_sims_hrex_iter(
             # Sum the per-potential components for performing swaps
             U_kl = verify_and_sanitize_potential_matrix(U_kl_raw.sum(0), hrex.replica_idx_by_state)
 
-            log_q_kl = -U_kl / kBT
+            log_q_kl = -U_kl * inv_kbt
+
+            # Re-order energies by state, must use the replica_idx_by_state_iter replica_idx_by_state and not hrex.replica_idx_by_state
+            # else the energies will be wrong if iterations_per_frame > 1
+            iterated_u_kln[:, :, :, current_frame * iters_per_frame + i] = sanitize_energies_for_bar(
+                np.array(U_kl_raw[:, hrex.replica_idx_by_state]) * inv_kbt
+            )
 
             replica_idx_by_state_by_iter.append(hrex.replica_idx_by_state)
 
@@ -2603,11 +2659,6 @@ def run_sims_hrex_iter(
 
             fraction_accepted_by_pair_by_iter.append(fraction_accepted_by_pair)
 
-        # Re-order energies by state, must use the replica_idx_by_state_iter replica_idx_by_state and not hrex.replica_idx_by_state
-        # else the energies will be wrong if iterations_per_frame > 1
-        iterated_u_kln[:, :, :, current_frame] = (
-            sanitize_energies_for_bar(np.array(U_kl_raw[:, replica_idx_by_state_by_iter[-1]])) / kBT
-        )
         for samples, (xs, boxes, velos, final_barostat_volume_scale_factor) in zip(
             samples_by_state, samples_by_state_iter
         ):
@@ -2670,7 +2721,7 @@ def run_sims_hrex_iter(
             yield HREXCheckpoint(
                 completed_frames=completed_frames,
                 hrex=HREX(checkpoint_replicas, list(hrex.replica_idx_by_state)),
-                iterated_u_kln=iterated_u_kln[..., :completed_frames].copy(),
+                iterated_u_kln=iterated_u_kln[..., : completed_frames * iters_per_frame].copy(),
                 replica_idx_by_state_by_iter=[list(permutation) for permutation in replica_idx_by_state_by_iter],
                 fraction_accepted_by_pair_by_iter=[
                     list(counts_by_pair) for counts_by_pair in fraction_accepted_by_pair_by_iter

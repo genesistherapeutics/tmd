@@ -6,8 +6,10 @@ from rdkit import Chem
 from tmd.fe.topology import BaseTopology
 from tmd.fe.utils import get_mol_masses, get_romol_conf
 from tmd.ff import Forcefield
+from tmd.integrator import ConstraintSolver
 from tmd.lib import ConstraintGroups, custom_ops
-from tmd.md.constraints.utils import get_hydrogen_bond_constraint_groups
+from tmd.md.constraints.utils import get_hydrogen_bond_constraint_groups, prune_constrained_valence_terms
+from tmd.potentials import HarmonicBond
 
 
 @pytest.fixture(scope="module")
@@ -26,11 +28,11 @@ def ff():
 
 
 @pytest.mark.nogpu
-def test_constraint_groups_from_mol(simple_mol, water_mol):
-    constraints = get_hydrogen_bond_constraint_groups(simple_mol)
+def test_constraint_groups_from_mol(simple_mol, water_mol, ff):
+    constraints = get_hydrogen_bond_constraint_groups(simple_mol, ff)
     assert len(constraints.groups) == 0
 
-    constraints = get_hydrogen_bond_constraint_groups(water_mol)
+    constraints = get_hydrogen_bond_constraint_groups(water_mol, ff)
     assert len(constraints.groups) == 1
     assert constraints.groups[0] == [0, 1, 2]
     assert len(constraints.distances[0]) == 2
@@ -126,7 +128,7 @@ def test_constraint_groups_from_mol(simple_mol, water_mol):
 M  END""",
         removeHs=False,
     )
-    constraints = get_hydrogen_bond_constraint_groups(mol)
+    constraints = get_hydrogen_bond_constraint_groups(mol, ff)
     assert len(constraints.groups) == 12
 
     # Shuffling the atom order shouldn't change the results
@@ -134,7 +136,7 @@ M  END""",
         atom_ordering = np.arange(mol.GetNumAtoms())
         rng.shuffle(atom_ordering)
         mol = Chem.RenumberAtoms(mol, atom_ordering.tolist())
-        constraints = get_hydrogen_bond_constraint_groups(mol)
+        constraints = get_hydrogen_bond_constraint_groups(mol, ff)
         assert len(constraints.groups) == 12
 
 
@@ -149,6 +151,27 @@ def test_empty_constraints(precision, simple_mol):
     assert constraints.num_systems() == 1
     assert constraints.num_atoms() == len(masses)
     assert constraints.n_groups() == 0
+
+
+@pytest.mark.parametrize("precision", [np.float32])
+def test_wrong_number_of_systems_for_constraints(precision, simple_mol):
+    masses = get_mol_masses(simple_mol).astype(precision)
+    constraints = (
+        custom_ops.ConstraintGroups_f32(masses, [], [], 15, 1e-8)
+        if precision == np.float32
+        else custom_ops.ConstraintGroups_f64(masses, [], [], 15, 1e-8)
+    )
+    assert constraints.num_systems() == 1
+    assert constraints.num_atoms() == len(masses)
+    assert constraints.n_groups() == 0
+
+    x0 = get_romol_conf(simple_mol).astype(precision)
+
+    constrained = constraints.constrain_positions(x0)
+    np.testing.assert_array_equal(x0, constrained)
+
+    with pytest.raises(RuntimeError, match="number of systems must match, got 3 expected 1"):
+        constraints.constrain_positions(np.stack([x0] * 3))
 
 
 @pytest.mark.parametrize("precision", [np.float32, np.float64])
@@ -251,6 +274,40 @@ def test_constrain_positions_water(precision, water_mol, ff):
             )
 
 
+def _max_constraint_violation(x, groups, distances):
+    violations = []
+    for group, dists in zip(groups, distances):
+        anchor = group[0]
+        for atom, target_dist in zip(group[1:], dists):
+            dist = np.linalg.norm(x[anchor] - x[atom])
+            violations.append(abs(dist - target_dist))
+    return max(violations)
+
+
+def _perturb_coordinates(x0, rng, magnitude: float = 0.025):
+    """Perturb every atom by some quantity. This should result in coordinates that are
+    difficult to fix up with constraints
+    """
+    return x0 + magnitude * rng.normal(size=x0.shape)
+
+
+@pytest.mark.nocuda
+@pytest.mark.parametrize("seed", range(5))
+def test_reference_shake_perturbed_water(seed, water_mol, ff):
+    rng = np.random.default_rng(seed)
+    bt = BaseTopology(water_mol, ff)
+    masses = np.array(get_mol_masses(water_mol), dtype=np.float64)
+    constraints_obj = bt.get_constraint_groups()
+
+    solver = ConstraintSolver(masses, constraints_obj.groups, constraints_obj.distances)
+    x0 = np.array(get_romol_conf(water_mol), dtype=np.float64)
+
+    constrained = solver.apply_shake(_perturb_coordinates(x0, rng), x0)
+
+    violation = _max_constraint_violation(constrained, constraints_obj.groups, constraints_obj.distances)
+    assert violation < solver._tol, f"Constraint violation {violation:.2e} >= {solver._tol:.3e} (seed={seed})"
+
+
 @pytest.mark.parametrize("precision", [np.float32, np.float64])
 def test_constrain_positions_already_satisfied(precision, water_mol, ff):
     bt = BaseTopology(water_mol, ff)
@@ -267,7 +324,7 @@ def test_constrain_positions_already_satisfied(precision, water_mol, ff):
         )
     )
 
-    x0 = get_romol_conf(water_mol).astype(precision)
+    x0 = constraints.constrain_positions(get_romol_conf(water_mol).astype(precision))
     constrained = constraints.constrain_positions(x0)
 
     # If the coords already satisfy constraints, they should be nearly unchanged
@@ -363,3 +420,36 @@ def test_dataclass_sort(precision, water_mol, ff):
     sorted_constraints = constraints.sort()
     assert sorted_constraints.water_group_indices[0] == 0
     assert len(sorted_constraints.groups) == len(constraints.groups)
+
+
+@pytest.mark.nogpu
+def test_prune_potentials(water_mol, ff):
+    bt = BaseTopology(water_mol, ff)
+
+    x0 = get_romol_conf(water_mol)
+    box = np.eye(3) * 100.0
+    constraints = bt.get_constraint_groups()
+
+    endstate = bt.setup_end_state()
+
+    bps = endstate.get_U_fns()
+
+    pruned_bps = prune_constrained_valence_terms(bps, constraints)
+
+    assert len(pruned_bps) == len(bps)
+
+    for bp, pruned_bp in zip(bps, pruned_bps):
+        assert type(bp.potential) is type(pruned_bp.potential)
+        if isinstance(bp.potential, HarmonicBond):
+            assert len(pruned_bp.potential.idxs) == 0
+            assert len(pruned_bp.params) == 0
+
+            assert len(bp.potential.idxs) == 2
+            assert len(bp.params) == 2
+        else:
+            np.testing.assert_array_equal(bp.potential.idxs, pruned_bp.potential.idxs)
+            np.testing.assert_array_equal(bp.params, pruned_bp.params)
+
+        # Potentials should still be valid to execute
+        assert np.isfinite(bp(x0, box))
+        assert np.isfinite(pruned_bp(x0, box))
